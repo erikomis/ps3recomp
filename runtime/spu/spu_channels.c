@@ -2160,7 +2160,27 @@ void spu_indirect_branch(spu_context* ctx)
             if (n <= 4 || (n % 4096) == 0)
                 fprintf(stderr, "[spurs-pm] poll #%u (r3=0x%08X) -> continue\n",
                         n, ctx->gpr[3]._u32[0]);
-            ctx->gpr[3] = spu_make_preferred_u32(0);
+            if (g_spurs_poll_select) {
+                /* The kernel returns {selected wid, its PM address} in the
+                 * preferred doubleword, and the PM's PollStatus wrapper
+                 * (func_00003378) yields when the wid is not its own (LS
+                 * 0x1DC). A bare 0 means "wid 0 selected": wid 0 never yields
+                 * and every other workload yields at its first poll. */
+                const uint8_t* k = ctx->ls;
+#define LSBE32(o) (((uint32_t)k[(o)] << 24) | ((uint32_t)k[(o)+1] << 16) | \
+                   ((uint32_t)k[(o)+2] << 8) | (uint32_t)k[(o)+3])
+                uint32_t cur = LSBE32(0x1DC);
+                uint32_t sel = g_spurs_poll_select(LSBE32(0x1C4), LSBE32(0x1C8), cur);
+                ctx->gpr[3] = spu_make_preferred_u32(sel);
+                ctx->gpr[3]._u32[1] = sel == cur ? LSBE32(0x1D4) : 0;
+#undef LSBE32
+                if (sel != cur) {
+                    static int _y = 0;
+                    if (PS3_LOG_FIRST(_y, 16))
+                        fprintf(stderr, "[spurs-pm] poll: wid %u yields to %u\n", cur, sel);
+                }
+            } else
+                ctx->gpr[3] = spu_make_preferred_u32(0);
             ctx->pc = ctx->gpr[0]._u32[0] & SPU_LS_MASK;
             return;
         }

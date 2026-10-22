@@ -499,6 +499,11 @@ SPU_GATE int g_spu_ls_probe   = -1;  /* spu_ls_read_probe (SPU_LS_LOWREAD)      
 SPU_GATE int g_spu_smc_watch  = -1;  /* spu_ls_write_probe_smc (SPU_SMC_WATCH)  */
 SPU_GATE int g_wws_code_probe = 0;   /* WWS code-buffer resolution, capped      */
 SPU_GATE int g_wws_read_probe = 0;
+/* Set by cellSpurs.c under SPURS_RPCS3_SCHED=1: the workload the SPURS kernel
+ * would select for (spurs EA, spuNum, polling wid), which spu_channels.c gives
+ * a policy module's cellSpursModulePollStatus. NULL keeps the old answer. A
+ * gate here so cellSpurs.c links without spu_channels.c. */
+SPU_GATE uint32_t (*g_spurs_poll_select)(uint32_t, uint32_t, uint32_t) = 0;
 static __attribute__((noinline, cold)) void spu_ls_read_probe(const spu_context* ctx, uint32_t lsa)
 {
     if (g_spu_ls_probe < 0) g_spu_ls_probe = getenv("SPU_LS_LOWREAD") ? 1 : 0;

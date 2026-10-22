@@ -1711,6 +1711,62 @@ static DWORD WINAPI spurs_pm_worker(LPVOID p)
     return 0;
 }
 
+/* SPURS_RPCS3_SCHED=1: pick workloads the way the SPURS kernel does (RPCS3's
+ * cellSpursSpu.cpp spursKernel1SelectWorkload, used as an oracle; no code
+ * copied). The kernel never decrements wklReadyCount1: it is the number of
+ * SPUs the workload asks for, and the policy module lowers it itself (Resistance's
+ * wwsjob PM swaps it to 0 before its last empty-queue check, func_00003470,
+ * and puts it back with a compare-and-swap, func_000033D0). A workload is a
+ * candidate on SPU sn when it is enabled, runnable, has a non-zero priority on
+ * sn, is below its max contention, and is signalled or has readyCount above
+ * its contention; the highest weight wins: wanted (0x8000), then priority
+ * (1 highest .. 15 lowest), then "the one already running here", then below
+ * min contention, then fewer SPUs. cur = the polling workload (its own SPU is
+ * not counted against it), or -1 for a free SPU. Returns -1 when nothing is
+ * eligible. */
+static int spurs_select_wid(u32 ea, u32 sn, int cur)
+{
+    u32 enabled = vm_read32(ea + SPURS_WKL_ENABLED);
+    u32 signal  = vm_read16(ea + SPURS_WKL_SIGNAL1);
+    int best = -1; u32 best_w = 0;
+    for (u32 i = 0; i < 16; i++) {
+        if (!(enabled & (0x80000000u >> i))) continue;
+        if (vm_read8(ea + SPURS_WKL_STATE1 + i) != 2) continue;
+        u32 prio = vm_read8(ea + SPURS_WKL_INFO1 + i * SPURS_WKL_INFO_SZ + 0x18 + sn) & 0xF;
+        if (!prio) continue;
+        u32 cont = vm_read8(ea + SPURS_WKL_CURCONT + i);
+        if ((int)i == cur && cont) cont--;
+        u32 maxc = vm_read8(ea + SPURS_WKL_MAXCONT + i) & 0xF;
+        if (maxc <= cont) continue;
+        u32 ready = vm_read8(ea + SPURS_WKL_READY1 + i);
+        if (ready > 8) ready = 8;
+        int sig = (signal & (0x8000u >> i)) != 0;
+        if (!sig && ready <= cont) continue;
+        u32 w = 0x8000u | ((0x10u - prio) << 8);
+        if ((int)i == cur) w |= 0x80u;
+        if ((vm_read8(ea + SPURS_WKL_MINCONT + i) & 0xF) > cont) w |= 0x40u;
+        w |= (8u - (cont > 8 ? 8 : cont)) & 0xFu;
+        if (w > best_w) { best_w = w; best = (int)i; }
+    }
+    return best;
+}
+
+static int spurs_rpcs3_sched(void)
+{
+    static int s = -1;
+    if (s < 0) s = getenv("SPURS_RPCS3_SCHED") ? 1 : 0;
+    return s;
+}
+
+/* cellSpursModulePollStatus from a policy module (spu_channels.c): the
+ * workload the kernel would run on this SPU now; 0x20 (the system service
+ * id) when nothing is eligible, as the real kernel answers. */
+static uint32_t spurs_poll_select(uint32_t ea, uint32_t sn, uint32_t cur)
+{
+    int w = spurs_select_wid(ea, sn, (int)cur);
+    return w < 0 ? 0x20u : (uint32_t)w;
+}
+
 static DWORD WINAPI spurs_kernel_thread(LPVOID p)
 {
     struct SpursInst* si = (struct SpursInst*)p;
@@ -1727,6 +1783,39 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
         for (u32 sn = 0; sn < si->nspus; sn++) {
             struct SpursPmSlot* slot = &si->slots[sn];
             if (slot->busy) continue;
+            if (spurs_rpcs3_sched()) {
+                int wsel = spurs_select_wid(ea, sn, -1);
+                if (wsel < 0) continue;
+                u32 wid = (u32)wsel;
+                {   static int s_sl = -1; static unsigned s_n = 0;
+                    if (s_sl < 0) s_sl = getenv("SPURS_SEL_LOG") ? 1 : 0;
+                    if (s_sl && (s_n++ < 400 || (s_n % 1000) == 0))
+                        fprintf(stderr, "[spurs-sel] spu%u runs wid %u (ready=%u cont=%u signal=0x%04X)\n",
+                                sn, wid, vm_read8(ea + SPURS_WKL_READY1 + wid),
+                                vm_read8(ea + SPURS_WKL_CURCONT + wid),
+                                vm_read16(ea + SPURS_WKL_SIGNAL1)); }
+                WklPm* pm = (s_workloads[wid].in_use && s_workloads[wid].spurs_ea == ea)
+                          ? spurs_resolve_pm(wid) : NULL;
+                if (!pm) continue;
+                /* Consume the signal only; readyCount belongs to the PM. */
+                spu_lockline_lock();
+                u32 signal = vm_read16(ea + SPURS_WKL_SIGNAL1);
+                if (signal & (0x8000u >> wid))
+                    ef_w16(ea + SPURS_WKL_SIGNAL1, (u16)(signal & ~(0x8000u >> wid)));
+                ef_line_end(ea);
+                slot->fn = pm->fn; slot->image_id = pm->image_id;
+                slot->pm = vm_base + (u32)(uintptr_t)s_workloads[wid].pm;
+                slot->pm_size = s_workloads[wid].sizePm;
+                slot->data = vm_read64(ea + SPURS_WKL_INFO1 + wid * SPURS_WKL_INFO_SZ + 8);
+                slot->wid = wid; slot->ea = ea;
+                si->active[wid]++;
+                spu_lockline_lock();
+                vm_base[ea + SPURS_WKL_CURCONT + wid] = si->active[wid];
+                ef_line_end(ea);
+                slot->busy = 1;
+                WakeAllConditionVariable(&si->wake);
+                continue;
+            }
             for (u32 checked = 0; checked < 16; checked++) {
                 u32 wid = si->cursor;
                 si->cursor = (wid + 1) & 15;
@@ -1775,6 +1864,7 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
 
 static s32 spurs_scheduler_start(struct SpursInst* si)
 {
+    if (spurs_rpcs3_sched()) g_spurs_poll_select = spurs_poll_select;   /* spu_context.h */
     si->stopping = 0; si->cursor = si->pass_no = 0;
     memset(si->active, 0, sizeof(si->active));
     memset(si->idle, 0, sizeof(si->idle));
@@ -1854,7 +1944,11 @@ s32 cellSpursReadyCountStore(CellSpurs* spurs, CellSpursWorkloadId wid,
     /* The real store: the instance byte the kernel (poll thread) watches. */
     vm_write8(si->ea + SPURS_WKL_READY1 + wid, (u8)value);
     {   static int _n = 0;
-        if (_n < 32)
+        /* SPURS_RC_LOG=1: every store, not just the first 32 (a title's audio
+         * workload alone spends those in the first second). */
+        static int s_all = -1;
+        if (s_all < 0) s_all = getenv("SPURS_RC_LOG") ? 1 : 0;
+        if (_n < 32 || s_all)
             printf("[cellSpurs] ReadyCountStore(wid=%u, value=%u)\n", wid, value);
         else if (_n == 32)
             printf("[cellSpurs] ReadyCountStore further logs suppressed\n");
