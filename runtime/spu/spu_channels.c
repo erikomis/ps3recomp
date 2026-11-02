@@ -319,9 +319,15 @@ static DWORD WINAPI spu_pcsample_thread(LPVOID p)
 
 static mfc_engine* mfc_for(spu_context* ctx)
 {
-    { static volatile LONG started = 0; const char* e;
-      if (!started && (e = getenv("SPU_PCSAMPLE")) && !InterlockedExchange(&started, 1))
-          CreateThread(NULL, 0, spu_pcsample_thread, (LPVOID)(uintptr_t)(atoi(e) * 1000), 0, NULL); }
+    { static volatile LONG started = 0;
+      /* One-shot: flip the flag regardless of the lookup result, so the hot
+       * MFC path never pays getenv (+ its env lock, contested by the other SPU
+       * threads) again. An env value read at the first call controls sampling. */
+      if (!InterlockedExchange(&started, 1)) {
+          const char* e = getenv("SPU_PCSAMPLE");
+          if (e)
+              CreateThread(NULL, 0, spu_pcsample_thread, (LPVOID)(uintptr_t)(atoi(e) * 1000), 0, NULL);
+      } }
     AcquireSRWLockShared(&s_mfc_claim_lock);
     for (spu_mfc_slot* slot = s_mfc_slots; slot; slot = slot->next) {
         if (slot->ctx == ctx) {
