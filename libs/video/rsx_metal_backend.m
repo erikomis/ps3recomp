@@ -768,6 +768,11 @@ static void dump_shader(const char* name, const char* text)
 static MTLCompileOptions* guest_compile_options(void)
 {
     MTLCompileOptions* o = [MTLCompileOptions new];
+    /* A title's Z-prepass and its colour pass are different vertex programs that
+     * compute the same position, then compare with LEQUAL. Without invariance the
+     * GPU compiler may round them 1 ULP apart and the colour pass fails in patches:
+     * Deadpool got checkered surfaces and old pixels left in the scene. */
+    if (@available(macOS 11.0, *)) o.preserveInvariance = YES;
     /* IEEE comparisons. The decompilers flush a NaN result to zero with
      * `x == x`, and the alpha test compares with isunordered; Metal's default
      * fast math is free to fold both away. */
@@ -789,7 +794,13 @@ static MTLCompileOptions* guest_compile_options(void)
 static id<MTLFunction> compile_guest_function(const char* msl, const char* what)
 {
     NSError* err = nil;
-    id<MTLLibrary> lib = [s_dev newLibraryWithSource:[NSString stringWithUTF8String:msl]
+    /* See guest_compile_options: the attribute is what preserveInvariance acts on.
+     * Vertex outputs only: a fragment program reads [[position]] as an input. */
+    NSString* src = [NSString stringWithUTF8String:msl];
+    if ([src containsString:@"vertex main0_out main0"])
+        src = [src stringByReplacingOccurrencesOfString:@"[[position]]"
+                                             withString:@"[[position, invariant]]"];
+    id<MTLLibrary> lib = [s_dev newLibraryWithSource:src
                                              options:guest_compile_options()
                                                error:&err];
     if (!lib) {
@@ -2767,15 +2778,16 @@ static u32 eng_surface_view(void* user, u32 surface, u32 remap, u32 rsx_format)
 
 /* Allocate now, copy in command order. The returned object is unique to
  * this draw; later snapshots never overwrite a queued draw's sampled image. */
-static u32 eng_color_snapshot(void* user, u32 surface)
+static u32 eng_color_snapshot_rect(void* user, u32 surface, u32 w, u32 h)
 {
     (void)user;
     id<MTLTexture> src = eng_obj(surface);
     if (!src || [src textureType] != MTLTextureType2D || [src sampleCount] != 1 ||
+        !w || !h || w > [src width] || h > [src height] ||
         s_eng_rec_count >= ENG_MAX_RECORDS) { s_eng_dropped++; return 0; }
     MTLTextureDescriptor* td =
         [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:[src pixelFormat]
-                         width:[src width] height:[src height] mipmapped:NO];
+                         width:w height:h mipmapped:NO];
     td.storageMode = MTLStorageModePrivate;
     td.usage = MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
     const u32 copy = eng_obj_add([s_dev newTextureWithDescriptor:td]);
@@ -2786,6 +2798,13 @@ static u32 eng_color_snapshot(void* user, u32 surface)
     r->rt[0] = surface;
     r->resolve_dst = copy;
     return copy;
+}
+
+static u32 eng_color_snapshot(void* user, u32 surface)
+{
+    id<MTLTexture> src = eng_obj(surface);
+    if (!src) { s_eng_dropped++; return 0; }
+    return eng_color_snapshot_rect(user, surface, (u32)[src width], (u32)[src height]);
 }
 
 static u32 eng_depth_target_create(void* user, u32 w, u32 h)
@@ -3312,8 +3331,8 @@ static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
             const EngRecord* r = &s_eng_rec[i++];
             id<MTLTexture> src = eng_obj(r->rt[0]);
             id<MTLTexture> dst = eng_obj(r->resolve_dst);
-            if (!src || !dst || [src width] != [dst width] ||
-                [src height] != [dst height] || [src pixelFormat] != [dst pixelFormat]) {
+            if (!src || !dst || [src width] < [dst width] ||
+                [src height] < [dst height] || [src pixelFormat] != [dst pixelFormat]) {
                 s_eng_dropped++; continue;
             }
             id<MTLBlitCommandEncoder> copy = [cb blitCommandEncoder];
@@ -3321,7 +3340,7 @@ static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
             s_ft_copies++;
             [copy copyFromTexture:src sourceSlice:0 sourceLevel:0
                    sourceOrigin:MTLOriginMake(0, 0, 0)
-                     sourceSize:MTLSizeMake([src width], [src height], 1)
+                     sourceSize:MTLSizeMake([dst width], [dst height], 1)
                       toTexture:dst destinationSlice:0 destinationLevel:0
               destinationOrigin:MTLOriginMake(0, 0, 0)];
             [copy endEncoding];
@@ -3817,6 +3836,7 @@ static const rsx_draw_backend s_engine_backend = {
     .depth_snapshot       = eng_depth_snapshot,
     .depth_readback       = eng_depth_readback,
     .color_snapshot       = eng_color_snapshot,
+    .color_snapshot_rect  = eng_color_snapshot_rect,
     .pipeline_create      = eng_pipeline_create,
     .pipeline_release     = eng_pipeline_release,
     .bind_targets         = eng_bind_targets,

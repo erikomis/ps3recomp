@@ -235,6 +235,9 @@ typedef struct rsx_draw_backend {
      * engine owns the returned handle and releases it with texture_release.
      * 0 rejects the consuming draw; NULL retains the legacy guest-upload route. */
     u32 (*color_snapshot)(void* user, u32 surface);
+    /* Optional. The same copy of only the top-left w x h: a texture that names
+     * part of a larger target at the same offset and pitch. */
+    u32 (*color_snapshot_rect)(void* user, u32 surface, u32 w, u32 h);
 
     /* Optional. 3D textures (SET_TEXTURE_FORMAT dimension 3, CONTROL3 depth):
      * a volume of `depth` slices per level, each slice one upload of decoded
