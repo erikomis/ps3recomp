@@ -16,7 +16,7 @@
  *   0x1C8 be u32 spuNum             0x1DC be u32 wklCurrentId
  *   0x1CC be u32 dmaTagId           0x1E0 be u32 exitToKernelAddr
  *   0x1D0 be u64 wklCurrentAddr     0x1E4 be u32 selectWorkloadAddr
- *        (PM base 0xA00, in the LOW word at 0x1D4)
+ *        (the module's EA, in the LOW word at 0x1D4)
  *
  * exitToKernel/selectWorkload point at two reserved LS addresses below the PM
  * base; spu_indirect_branch intercepts them (ctx->policy_mode) and HLEs the
@@ -260,7 +260,11 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
     KBE32(0x1C8, spu_num);              /* spuNum (virtual SPU / lane row) */
     KBE32(0x1CC, 8);                    /* dmaTagId (kernel's tag)  */
     KBE32(0x1D0, 0);                    /* wklCurrentAddr hi32 (u64 ptr) */
-    KBE32(0x1D4, 0xA00);                /* wklCurrentAddr lo32 = PM load base */
+    /* The module's EA, as the real kernel sets it (not its LS base). A module
+     * bigger than the workload's declared size DMAs its own remainder from
+     * here + size: libspurs_jq's reads 0x3B00 more bytes to LS 0x4A00. */
+    { extern uint8_t* vm_base;
+      KBE32(0x1D4, (uint32_t)(pm_host - vm_base)); } /* wklCurrentAddr lo32 */
     KBE32(0x1D8, wid);                  /* wklCurrentUniqueId       */
     KBE32(0x1DC, wid);                  /* wklCurrentId             */
     KBE32(0x1E0, SPURS_PM_EXIT_TO_KERNEL_LS);
