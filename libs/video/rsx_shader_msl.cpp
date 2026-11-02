@@ -29,6 +29,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#include <string.h>
 
 #if defined(PS3RECOMP_HAVE_MSL_TRANSLATION)
 
@@ -176,6 +179,50 @@ done:
 
 extern "C" int rsx_hlsl_to_msl_available(void) { return 1; }
 
+/* RSX_MSL_CACHE=<dir>: translated shaders on disk. glslang, the SPIR-V optimizer and
+ * spirv-cross run on the render thread the first time a shader appears, a visible
+ * hitch each, and every run paid for all of them again. Keyed on the HLSL, so a
+ * decompiler change misses by itself; bump the version when this translator changes. */
+static const unsigned kMslCacheVersion = 1;
+
+static bool msl_cache_path(const char* hlsl, int stage, char* path, size_t path_size)
+{
+    static const char* dir = getenv("RSX_MSL_CACHE");
+    if (!dir || !*dir) return false;
+    static bool made = false;
+    if (!made) { mkdir(dir, 0755); made = true; }
+    unsigned long long h = 1469598103934665603ULL;
+    size_t n = 0;
+    for (const char* p = hlsl; *p; p++, n++) { h ^= (unsigned char)*p; h *= 1099511628211ULL; }
+    snprintf(path, path_size, "%s/v%u_%d_%016llx_%zu.msl", dir, kMslCacheVersion, stage, h, n);
+    return true;
+}
+
+static bool msl_cache_read(const char* path, char* out, u32 out_size)
+{
+    FILE* f = fopen(path, "rb");
+    if (!f) return false;
+    const size_t got = fread(out, 1, out_size - 1, f);
+    const bool whole = got > 0 && feof(f);
+    fclose(f);
+    if (!whole) { out[0] = '\0'; return false; }
+    out[got] = '\0';
+    return true;
+}
+
+/* Through a temporary name: a run stopped mid-write must not leave half a shader. */
+static void msl_cache_write(const char* path, const char* msl)
+{
+    char tmp[1200];
+    snprintf(tmp, sizeof tmp, "%s.%d.tmp", path, (int)getpid());
+    FILE* f = fopen(tmp, "wb");
+    if (!f) return;
+    const size_t n = strlen(msl);
+    const bool ok = fwrite(msl, 1, n, f) == n;
+    fclose(f);
+    if (!ok || rename(tmp, path) != 0) remove(tmp);
+}
+
 extern "C" int rsx_hlsl_to_msl(const char* hlsl, int stage,
                                char* out, u32 out_size,
                                char* log, u32 log_size)
@@ -186,6 +233,9 @@ extern "C" int rsx_hlsl_to_msl(const char* hlsl, int stage,
         return -1;
     }
     out[0] = '\0';
+    char cache_path[1100];
+    const bool cached = msl_cache_path(hlsl, stage, cache_path, sizeof cache_path);
+    if (cached && msl_cache_read(cache_path, out, out_size)) return 0;
     if (!glslang_ready()) {
         put_log(log, log_size, "glslang::InitializeProcess failed", nullptr);
         return -1;
@@ -194,6 +244,7 @@ extern "C" int rsx_hlsl_to_msl(const char* hlsl, int stage,
     std::vector<unsigned int> spirv;
     if (!hlsl_to_spirv(hlsl, lang, spirv, log, log_size)) return -1;
     if (!spirv_to_msl(spirv, out, out_size, log, log_size)) return -1;
+    if (cached) msl_cache_write(cache_path, out);
     return 0;
 }
 
