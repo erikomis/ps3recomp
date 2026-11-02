@@ -3712,7 +3712,11 @@ static void eng_dump_frame(id<MTLTexture> src)
     const char* path = getenv("PS3RECOMP_METAL_FRAME_DUMP");
     if (!path || !*path) return;
     static unsigned frame;
-    if ((++frame % 120) != 0) return;
+    /* PS3RECOMP_METAL_FRAME_DUMP_EVERY=<n>: how often, for catching a defect that
+     * lasts a frame or two. */
+    static int every = 0;
+    if (!every) { const char* e = getenv("PS3RECOMP_METAL_FRAME_DUMP_EVERY"); every = (e && atoi(e) > 0) ? atoi(e) : 120; }
+    if ((++frame % every) != 0) return;
     if ([src pixelFormat] != MTLPixelFormatRGBA8Unorm &&
         [src pixelFormat] != MTLPixelFormatBGRA8Unorm) return;
     size_t w = [src width], h = [src height];
