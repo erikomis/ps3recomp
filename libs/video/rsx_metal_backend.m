@@ -54,6 +54,13 @@
 #endif
 
 #include <pthread.h>
+#include "../input/host_input_cocoa.h"   /* keys and mouse of the own window */
+/* cellPad.c's block; weak so a build without the pad still links. */
+__attribute__((weak)) ps3_host_input* ps3_pad_host_input(void)
+{
+    static ps3_host_input local;
+    return &local;
+}
 #include "metal_frame_rate.h"
 #include <stdatomic.h>
 #include "rsx_commands.h"
@@ -3972,10 +3979,17 @@ void rsx_metal_backend_shutdown(void)
     }
 }
 
+#if !TARGET_OS_IPHONE
+/* The own window's keys and mouse: cellPad's block. */
+static HostInputCocoa s_input;
+#endif
+
 static int pump_messages_impl(void)
 {
 #if !TARGET_OS_IPHONE
     if (s_headless || !s_ready) return 0;
+    HostInputCocoa* input = s_window ? &s_input : NULL;
+    if (input && !input->in) input->in = ps3_pad_host_input();
     @autoreleasepool {
         for (;;) {
             NSEvent* ev = [NSApp nextEventMatchingMask:NSEventMaskAny
@@ -3983,7 +3997,13 @@ static int pump_messages_impl(void)
                                                 inMode:NSDefaultRunLoopMode
                                                dequeue:YES];
             if (!ev) break;
+            /* A key the pad takes is swallowed, or AppKit beeps at every press. */
+            if (input && hic_event(input, ev, s_window)) continue;
             [NSApp sendEvent:ev];
+        }
+        if (input) {
+            hic_tick(input);
+            if (![s_window isKeyWindow]) hic_focus_lost(input);
         }
     }
 #endif
