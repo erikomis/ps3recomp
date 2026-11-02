@@ -313,6 +313,8 @@ static _Atomic(u64) s_user_pending = 0;
 #define GCM_USER_PENDING_TAKE() atomic_exchange(&s_user_pending, 0)
 #endif
 
+static int gcm_userq_enabled(void);   /* GCM_USERCMD_QUEUE, see cellGcmQueueUserCommand */
+
 /* Tile configuration (up to 15 tiles, 8 commonly used) */
 static CellGcmTileInfo s_tiles[CELL_GCM_MAX_TILE_COUNT];
 
@@ -386,6 +388,13 @@ static int s_gcm_syscall_mode = 0;
  * -----------------------------------------------------------------------*/
 
 /* Populate the offset table entries for an IO mapping */
+/* Set once the title holds the guest copy of the tables. It indexes that copy
+ * live, so every later mapping has to reach it: Deadpool maps three more pages
+ * at the Marvel logo, and without this its gcmxk kernel read 0xFFFF for them and
+ * built job input addresses like 0xFFF209C0. */
+static int s_offset_tables_out = 0;
+static void gcm_publish_offset_tables(void);
+
 static void populate_offset_table(u32 ea, u32 io, u32 size)
 {
     /*
@@ -406,6 +415,7 @@ static void populate_offset_table(u32 ea, u32 io, u32 size)
         s_io_address_table[ea_page + i] = (u16)(io_page + i);
         s_ea_address_table[io_page + i] = (u16)(ea_page + i);
     }
+    if (s_offset_tables_out) gcm_publish_offset_tables();
 }
 
 /* Clear offset table entries for an IO mapping */
@@ -419,6 +429,7 @@ static void clear_offset_table(u32 ea, u32 io, u32 size)
         s_io_address_table[ea_page + i] = 0xFFFF;
         s_ea_address_table[io_page + i] = 0xFFFF;
     }
+    if (s_offset_tables_out) gcm_publish_offset_tables();
 }
 
 /* Find an IO mapping by EA */
@@ -814,7 +825,9 @@ void ppu_gcm_pump(void)
             g_ps3_guest_caller(s_flip_handler_opd, 1, 0, 0, 0, 0, 0, 0, 0);
         }
     }
-    if (user) {
+    if (gcm_userq_enabled()) {
+        /* Delivered by gcm_user_cmd_thread, in order. */
+    } else if (user) {
         u32 cmd = (u32)user;
         if (s_user_handler_opd && g_ps3_guest_caller)
             g_ps3_guest_caller(s_user_handler_opd, (uint64_t)cmd, 0, 0, 0, 0, 0, 0, 0);
@@ -893,8 +906,19 @@ static int s_park_pass = 0;           /* this drain stopped on a self-JUMP park 
  * title that keeps up never sees this path. */
 #define GCM_FIFO_CATCHUP_BYTES 0x10000u
 /* How long a self-JUMP park may stand with `put` somewhere else before the
- * drain gives up on it being patched and follows `put` instead. */
-#define GCM_PARK_GRACE_MS 50ull
+ * drain gives up on it being patched and follows `put` instead.
+ * GCM_PARK_GRACE_MS=<ms> overrides the 50 ms default: a title that releases
+ * its end-of-frame park from a vsync-paced flip handler (Deadpool's Unreal
+ * renderer does, func_007B1D14) can take longer than that under load, and the
+ * resync then drops the frame's fence -- the rendering thread waits on it for
+ * good. 0 never gives up on a park. */
+static unsigned long long gcm_park_grace_ms(void)
+{
+    static long long g = -1;
+    if (g < 0) { const char* e = getenv("GCM_PARK_GRACE_MS"); g = e ? strtoll(e, 0, 0) : 50; }
+    return g ? (unsigned long long)g : ~0ull;
+}
+#define GCM_PARK_GRACE_MS gcm_park_grace_ms()
 /* How close `current` must get to `end` before the runtime will recycle a ring
  * on the title's behalf. One gcmReserve is 8 bytes; a page of slack keeps a
  * title that is merely near the end from being touched. */
@@ -1468,8 +1492,21 @@ void gcm_forget_spu_blocks(void)
     s_spu_blk_w = 0;
 }
 
+/* Rung when an SPU stores the control register's `put`, if the host installed
+ * it (NULL otherwise). The RSX starts fetching the moment put moves; a drain
+ * that waits for the next frame-clock pass reads command memory up to a tick
+ * late, and Deadpool's gcmxk kernel recycles its ring and side buffers right
+ * after moving put (bad words, unmapped-JUMP / circling resyncs, dropped
+ * fences, a frozen picture). The runner wakes its frame clock on it; the
+ * drain itself stays on that one thread, which the draw engine relies on. */
+void (*g_gcm_put_doorbell)(void) = 0;
+
 void gcm_note_spu_put(u32 ea, u32 size)
 {
+    if (g_gcm_put_doorbell && ea <= GCM_CONTROL_GUEST_ADDR && ea + size > GCM_CONTROL_GUEST_ADDR) {
+        g_gcm_put_doorbell();
+        return;
+    }
     if (!size || size > 0x40000u) return;
     u32 room = 0;
     u32 io = gcm_ea2io_range(ea, &room);
@@ -2152,6 +2189,20 @@ static void gcm_rsx_process_fifo_unlocked(void)
                   if (sd && subch == 7 && (PS3_LOG_FIRST(s7, 16)))
                       fprintf(stderr, "[subch7] method=0x%04X data=0x%08X\n",
                               m, vm_read32(dea)); }
+                /* GCM_FLIP_COMMAND (method 0xFEAC, decoded as subchannel 7 /
+                 * 0x1EAC): what the firmware's cellGcmSetPrepareFlip writes into
+                 * the command buffer it is given (RPCS3: make_command(ctxt->
+                 * current, GCM_FLIP_COMMAND, {id})). The flip happens here, when
+                 * the RSX reaches it -- see GCM_PREPAREFLIP_FIFO. */
+                if (subch == 7 && m == 0x1EACu) {
+                    extern s32 gcm_flip_request_ext(u32 bufferId, int in_fifo);
+                    const u32 id = vm_read32(dea) & 0xFFu;
+                    gcm_flip_request_ext(id, 1);
+                    gcm_set_current_display_buffer(id);
+                    s_flip_pending = 1;
+                    s_flip_request_count++;
+                    continue;
+                }
                 if (subch == 7 && m == 0x0B00u) {
                     extern void rsx_raise_user_cmd(u32 arg);
                     rsx_raise_user_cmd(vm_read32(dea));
@@ -2305,7 +2356,12 @@ static void gcm_rsx_process_fifo_unlocked(void)
                         { static int rn = 0; if (PS3_LOG_FIRST(rn, 6)) printf("[GET_REPORT] type=%u off=0x%X dma=0x%08X%c", v >> 24, off, s_report_dma, 10); }
                         if (main_mem) {
                             /* CellGcmReportData, big-endian: u64 timer, u32 value, u32 padding. */
-                            const u32 rea = gcm_io2ea(off);
+                            /* CELL_GCM_CONTEXT_DMA_REPORT_LOCATION_MAIN addresses the report
+                             * area the title maps at IO 0x0E000000, not IO 0 (RPCS3:
+                             * 0x0e000000 + index * 0x10). At IO 0 Deadpool's occlusion
+                             * reports landed in its command ring, 16 bytes at a time, and
+                             * its gcmxk kernel parsed them as commands and lost its place. */
+                            const u32 rea = gcm_io2ea(s_report_dma == 0xBAD68000u ? 0x0E000000u + off : off);
                             if (rea) {
                                 vm_write32(rea, (u32)(ts >> 32));
                                 vm_write32(rea + 4u, (u32)ts);
@@ -2427,7 +2483,15 @@ static void gcm_rsx_process_fifo_unlocked(void)
      *
      * ponytail: append the JUMP at `current` the way the SDK's own callback
      * does, rather than tracking a second copy of the ring's geometry. */
-    if (s_gcm_ctx_out_ea) {
+    /* GCM_RING_RECYCLE=0 turns this off for a title whose callback chains
+     * segments itself. Deadpool's UE3 renderer (callback 0x0117BB3C) passes
+     * through cur >= end on its way to the next 16 KB segment; recycling
+     * there sent get back into a segment its SPU kernel was rewriting, and
+     * the walker circled it until the picture froze after the logos. */
+    static int s_recycle_on = -1;
+    if (s_recycle_on < 0) { const char* e = getenv("GCM_RING_RECYCLE");
+                            s_recycle_on = (e && e[0] == '0') ? 0 : 1; }
+    if (s_recycle_on && s_gcm_ctx_out_ea) {
         u32 ctx = vm_read32(s_gcm_ctx_out_ea);
         u32 begin = ctx ? vm_read32(ctx + 0x0) : 0;
         u32 end   = ctx ? vm_read32(ctx + 0x4) : 0;
@@ -2758,6 +2822,7 @@ static s32 gcm_flip_request(u32 bufferId, int in_fifo)
 }
 
 s32 cellGcmSetFlipCommand(u32 bufferId) { return gcm_flip_request(bufferId, 0); }
+s32 gcm_flip_request_ext(u32 bufferId, int in_fifo) { return gcm_flip_request(bufferId, in_fifo); }
 
 /* The real _cellGcmSetFlipCommand appends the flip to the command buffer, so
  * the RSX flips once it has executed everything queued before it. Firing it
@@ -2840,6 +2905,27 @@ s32 cellGcmSetPrepareFlip(void* ctx, u32 bufferId)
         return CELL_GCM_ERROR_INVALID_VALUE;
 
     printf("[cellGcmSys] SetPrepareFlip(bufferId=%u)\n", bufferId);
+
+    /* GCM_PREPAREFLIP_FIFO=1: do what the firmware does -- append the flip
+     * (GCM_FLIP_COMMAND, id) to the command buffer the title passed and return
+     * the id, leaving the flip to happen when the RSX reaches it. Deadpool's
+     * Unreal renderer builds its flip into a 124-byte side buffer
+     * (0x10BFE000 / 0x10BFE400) that the main FIFO calls at frame end; the
+     * call-time flip below left that buffer empty and told the title its frame
+     * was on screen before the RSX had run it, so it recycled command memory
+     * the drain had yet to read. */
+    { static int s_pf = -1;
+      if (s_pf < 0) { const char* e = getenv("GCM_PREPAREFLIP_FIFO"); s_pf = (e && *e == '1') ? 1 : 0; }
+      const u32 c = (u32)(uintptr_t)ctx;
+      if (s_pf && c) {
+          const u32 end = vm_read32(c + 4), cur = vm_read32(c + 8);
+          if (cur + 8 <= end) {
+              vm_write32(cur, 0x00040000u | 0xFEACu);
+              vm_write32(cur + 4, bufferId);
+              vm_write32(c + 8, cur + 8);
+              return (s32)bufferId;
+          }
+      } }
 
     gcm_set_current_display_buffer(bufferId);
     s_flip_status = CELL_GCM_FLIP_STATUS_DONE;
@@ -2936,6 +3022,7 @@ s32 cellGcmGetOffsetTable(CellGcmOffsetTable* table)
     if (!ea)
         return CELL_GCM_ERROR_INVALID_VALUE;
 
+    s_offset_tables_out = 1;
     gcm_publish_offset_tables();
 
     /* The guest struct is two 4-byte EAs, not two host pointers. */
@@ -3902,11 +3989,74 @@ void cellGcmSetUserCommand(u32 cmd)
 /* Called when a FIFO consumer retires a user-interrupt method. Publishing
  * the cause and pending marker is atomic; guest code runs later in the pump.
  * Like the driver cause register, multiple pending commands coalesce. */
+/* GCM_USERCMD_QUEUE=1: deliver every user command, in order.
+ *
+ * The single pending slot above keeps only the newest command: when the
+ * drain executes two GCM_SET_USER_COMMANDs before a guest thread next reaches
+ * the pump, the first is overwritten. Hardware raises one interrupt per
+ * command and the handler runs for each. Deadpool's Unreal renderer releases
+ * its end-of-frame FIFO park from that handler (func_007B210C ->
+ * func_007B1D14); a coalesced command left the park standing, the drain
+ * stopped there, and the rendering thread waited on its frame fence for good
+ * (frozen right after the logos). Off by default: other titles were tuned
+ * against the coalescing behaviour. */
+#define GCM_USERQ_N 256u
+static u32 s_userq[GCM_USERQ_N];
+static volatile u32 s_userq_head, s_userq_tail;   /* head: next to deliver */
+static SRWLOCK s_userq_lock = SRWLOCK_INIT;
+static int gcm_userq_enabled(void)
+{
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("GCM_USERCMD_QUEUE"); on = (e && *e == '1') ? 1 : 0; }
+    return on;
+}
+
+/* With the queue on, the handler runs on its own host thread, the way lv2
+ * runs it on the GCM interrupt thread: a handler may block (Deadpool's waits
+ * for the next frame to be queued), and run inside the pump on whichever guest
+ * thread reached an HLE call -- the rendering thread itself, say -- it waited
+ * on its own caller. */
+static DWORD WINAPI gcm_user_cmd_thread(LPVOID unused)
+{
+    (void)unused;
+    extern u32 gcm_userq_take_ext(int* ok);
+    for (;;) {
+        int ok; u32 cmd = gcm_userq_take_ext(&ok);
+        if (!ok) { Sleep(1); continue; }
+        if (s_user_handler_opd && g_ps3_guest_caller)
+            g_ps3_guest_caller(s_user_handler_opd, (uint64_t)cmd, 0, 0, 0, 0, 0, 0, 0);
+    }
+    return 0;
+}
+
 void cellGcmQueueUserCommand(u32 cmd)
 {
     GCM_USER_STORE(cmd);
+    if (gcm_userq_enabled()) {
+        static volatile long s_started = 0;
+        if (!s_started && !InterlockedExchange(&s_started, 1))
+            CreateThread(NULL, 1u << 20, gcm_user_cmd_thread, NULL, 0, NULL);
+        AcquireSRWLockExclusive(&s_userq_lock);
+        if (s_userq_tail - s_userq_head < GCM_USERQ_N)
+            s_userq[s_userq_tail++ % GCM_USERQ_N] = cmd;
+        else { static int n = 0; if (PS3_LOG_FIRST(n, 4))
+            fprintf(stderr, "[cellGcmSys] user command queue full -- dropping 0x%08X\n", cmd); }
+        ReleaseSRWLockExclusive(&s_userq_lock);
+    }
     GCM_USER_PENDING_STORE((1ULL << 32) | cmd);
 }
+
+/* Next queued user command, or 0 with *ok = 0 when the queue is empty. */
+u32 gcm_userq_take_ext(int* ok);
+static u32 gcm_userq_take(int* ok)
+{
+    u32 cmd = 0; *ok = 0;
+    AcquireSRWLockExclusive(&s_userq_lock);
+    if (s_userq_head != s_userq_tail) { cmd = s_userq[s_userq_head++ % GCM_USERQ_N]; *ok = 1; }
+    ReleaseSRWLockExclusive(&s_userq_lock);
+    return cmd;
+}
+u32 gcm_userq_take_ext(int* ok) { return gcm_userq_take(ok); }
 
 /* Invalidate a tile region (unbind + clear) */
 s32 cellGcmSetInvalidateTile(u8 index)
