@@ -1792,7 +1792,17 @@ static void ww_arm_inline_window(uint32_t ww)
     g_ww_lo = ww & ~15u;
     g_ww_hi = (ww & ~15u) + len;
 }
+static void barrier_watch_slow(uint32_t a, uint32_t v, int width, void* ra);
+/* Every guest store passes here. With no watch set (a normal run) it must cost one
+ * test: the checks below read about ten function-local statics per store, a few
+ * percent of the time of a busy guest thread. */
 static inline void barrier_watch_hit(uint32_t a, uint32_t v, int width, void* ra)
+{
+    static int s_any = -1;
+    if (s_any < 0) s_any = (getenv("PPU_WVAL") || getenv("PPU_WWATCH")) ? 1 : 0;
+    if (s_any || g_barrier_sync_watch) barrier_watch_slow(a, v, width, ra);
+}
+static void barrier_watch_slow(uint32_t a, uint32_t v, int width, void* ra)
 {
     /* PPU_WVAL=<hexvalue>: log every PPU store that WRITES this value, wherever
      * it lands. PPU_WWATCH answers "who writes this address"; when a bad value is
