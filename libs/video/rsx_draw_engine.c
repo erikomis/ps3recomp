@@ -904,6 +904,11 @@ static u32 eng_zdepth_snapshot(u32 slot)
     if (!g.be->depth_snapshot) return 0;
     const u32 tex = g.be->depth_snapshot(g.be->user, z->handle, z->w, z->h);
     if (!tex) return 0;
+    /* A draw already queued keeps the old copy: the backend retires a released
+     * object only after the recorded commands are encoded. Left unreleased, a
+     * title sampling its depth each frame filled the backend's 4096 object slots
+     * in about a minute, and from then on no texture could be created. */
+    if (z->snapshot) g.be->texture_release(g.be->user, z->snapshot);
     z->snapshot = tex;
     z->snapshot_valid = 1;
     return tex;
