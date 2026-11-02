@@ -1852,6 +1852,20 @@ static inline void barrier_watch_hit(uint32_t a, uint32_t v, int width, void* ra
                       s_wwlen = e2 ? (uint32_t)strtoul(e2,0,0) : 0x20;
                       if (s_wwlen < 0x20) s_wwlen = 0x20; }
       if (s_ww && a >= (s_ww & ~15u) && a < (s_ww & ~15u) + s_wwlen) {
+          /* PPU_WWATCH_JUMPS=1: only stores of an RSX JUMP word (0x20000000 |
+           * offset), for following how a title chains its command segments
+           * across a whole ring without the data stores drowning the log.
+           * Targets past 16 MB are left out: 0x3F800000 (1.0f) is a JUMP
+           * word too, and vertex constants outnumber real links. */
+          { static int s_j = -1; if (s_j < 0) s_j = getenv("PPU_WWATCH_JUMPS") ? 1 : 0;
+            if (s_j && !(width == 4 && v >= 0x20000000u && v < 0x21000000u)) return; }
+          /* PPU_WWATCH_TOP=<hex byte>: only 32-bit stores whose top byte is this,
+           * to follow one kind of pointer through a busy buffer. */
+          /* PPU_WWATCH_EQ=<hex>: only 32-bit stores of exactly this value. */
+          { static long long s_e = -2; if (s_e == -2) { const char* e = getenv("PPU_WWATCH_EQ"); s_e = e ? (long long)strtoul(e, 0, 16) : -1; }
+            if (s_e >= 0 && !(width == 4 && (uint32_t)v == (uint32_t)s_e)) return; }
+          { static int s_t = -2; if (s_t == -2) { const char* e = getenv("PPU_WWATCH_TOP"); s_t = e ? (int)strtoul(e, 0, 16) : -1; }
+            if (s_t >= 0 && !(width == 4 && (v >> 24) == (uint32_t)s_t)) return; }
           /* PPU_WW_GUARD=1: once the watched word is first SET, page-guard it.
            * The store watch only sees lifted guest stores -- a host-side memset
            * or an atomic clears a field invisibly. flOw loses its render config
@@ -3719,9 +3733,17 @@ extern "C" uint64_t ppu_guest_call(uint32_t opd_addr,
         return 0; }
 
     /* Private scratch stack high in the guest stack region, distinct from the
-     * main + ppu_thread stacks. One callback at a time per caller thread. */
+     * main + ppu_thread stacks. One callback at a time per caller thread --
+     * and one stack per caller thread: every thread used to start at the same
+     * 0xCFFE0000, so two host threads delivering callbacks at once (a GCM
+     * interrupt thread and a vblank tick, say) ran on top of each other's
+     * frames. 64 KB apart, downward from 0xCFFE0000. */
     static PPU_THREAD_LOCAL uint32_t s_cb_sp = 0;
-    if (!s_cb_sp) s_cb_sp = 0xCFFE0000u;
+    if (!s_cb_sp) {
+        static volatile int s_cb_slots = 0;
+        int slot = __atomic_fetch_add(&s_cb_slots, 1, __ATOMIC_RELAXED) % 32;
+        s_cb_sp = 0xCFFE0000u - (uint32_t)slot * 0x10000u;
+    }
 
     ppu_context ctx;
     memset(&ctx, 0, sizeof(ctx));

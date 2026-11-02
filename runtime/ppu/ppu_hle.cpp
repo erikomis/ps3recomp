@@ -611,6 +611,11 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
              * Opt out with YDKJ_NO_REENTRY_ISO=1. */
             { static int _ri=-1; if(_ri<0){ const char* e=getenv("YDKJ_NO_REENTRY_ISO"); _ri = (e && e[0]=='1') ? 0 : 1; }
               if(_ri){ uint64_t _sr1=ctx->gpr[1]; ctx->gpr[1]=(ctx->gpr[1]-0x1000)&~0xFull;
+                /* Arguments past the eighth live in the caller's parameter save
+                 * area, addressed from r1: the isolated frame needs its own copy.
+                 * Without it libspurs_jq's create read a NULL priority table, its
+                 * workload got priority 0 on every SPU and never ran. */
+                memcpy(vm_base + (uint32_t)ctx->gpr[1] + 0x30, vm_base + (uint32_t)_sr1 + 0x30, 0x100);
                 ps3_indirect_call(ctx); ctx->gpr[1]=_sr1; }
               else ps3_indirect_call(ctx); }       /* -> registered lifted libsre fn; r3=ret */
             /* A real PRX serving this import is a different implementation of it,
