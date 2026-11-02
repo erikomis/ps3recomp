@@ -24,6 +24,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#ifdef _WIN32
+#include <direct.h>   /* _mkdir */
+#endif
 
 /* ---------------------------------------------------------------------------
  * AES-128
@@ -413,6 +416,22 @@ int edat_is_npd(const char* host_path)
     return n == 4 && m[0] == 'N' && m[1] == 'P' && m[2] == 'D' && m[3] == 0;
 }
 
+/* The plaintext length an EDAT/SDAT header promises: the big-endian u64 at
+ * 0x88, after the 0x80-byte NPD header, the flags and the block size (the same
+ * field edat_decrypt_file reads as file_size). 0 if the header is unreadable. */
+static uint64_t edat_plain_size(const char* host_path)
+{
+    FILE* f = fopen(host_path, "rb");
+    if (!f) return 0;
+    uint8_t h[0x90];
+    size_t n = fread(h, 1, sizeof h, f);
+    fclose(f);
+    if (n != sizeof h) return 0;
+    uint64_t s = 0;
+    for (int i = 0; i < 8; i++) s = (s << 8) | h[0x88 + i];
+    return s;
+}
+
 /* The RIF key for a license-type-1/2 EDAT: $PS3_RIF_KEY as 32 hex chars, else
  * the 16 raw bytes of a <file>.rifkey sidecar. This is the buyer's own license
  * material for one content id -- deriving it from a .rap is deliberately out of
@@ -677,11 +696,43 @@ const char* edat_resolve(const char* host_path, char* buf, size_t cap)
     }
     if (!enabled || !host_path || !edat_is_npd(host_path)) return host_path;
 
-    if ((size_t)snprintf(buf, cap, "%s.dec", host_path) >= cap) return host_path;
+    /* PS3_EDAT_CACHE=<dir>: keep the decrypted copies under <dir>, mirroring
+     * the source path, instead of beside each EDAT. The game folder is often a
+     * link into an emulator's install (RPCS3's dev_hdd0), and writing a
+     * plaintext copy of every data file in there is not the port's call. */
+    static const char* cache_dir = (const char*)-1;
+    if (cache_dir == (const char*)-1) {
+        cache_dir = getenv("PS3_EDAT_CACHE");
+        if (cache_dir && !*cache_dir) cache_dir = NULL;
+    }
+    if (cache_dir) {
+        if ((size_t)snprintf(buf, cap, "%s/%s.dec", cache_dir, host_path) >= cap) return host_path;
+        for (char* q = buf + 1; *q; q++)                               /* mkdir -p */
+            if (*q == '/') {
+                *q = 0;
+#ifdef _WIN32
+                _mkdir(buf);
+#else
+                mkdir(buf, 0755);
+#endif
+                *q = '/';
+            }
+    } else if ((size_t)snprintf(buf, cap, "%s.dec", host_path) >= cap) return host_path;
 
     struct stat ss, ds;
-    if (stat(host_path, &ss) == 0 && stat(buf, &ds) == 0 && ds.st_mtime >= ss.st_mtime)
-        return buf;                                    /* cache still valid */
+    if (stat(host_path, &ss) == 0 && stat(buf, &ds) == 0 && ds.st_mtime >= ss.st_mtime) {
+        /* A copy cut short -- a decrypt killed part-way, a full disk -- is not
+         * a cache hit, and the mtime test alone kept one for good: Deadpool
+         * opened a 1.5 MB TexturesD.tfc where its 1.86 GB EDAT promised more,
+         * declared its own content broken (cellGameContentErrorDialog,
+         * BROKEN_EXIT_HDDGAME) and took its exit path a minute into every run.
+         * The header says how long the plaintext is; hold the cache to it. */
+        const uint64_t want = edat_plain_size(host_path);
+        if (!want || (uint64_t)ds.st_size == want)
+            return buf;                                /* cache still valid */
+        fprintf(stderr, "[edat] cached %s is %llu bytes, the header says %llu -- decrypting again\n",
+                buf, (unsigned long long)ds.st_size, (unsigned long long)want);
+    }
 
     if (edat_decrypt_file(host_path, buf) != 0) return host_path;
     return buf;
