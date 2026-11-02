@@ -50,6 +50,14 @@ static uint64_t spu_host_ns(void)
     return (uint64_t)(c.QuadPart / s_freq.QuadPart) * 1000000000ull
          + (uint64_t)(c.QuadPart % s_freq.QuadPart) * 1000000000ull
            / (uint64_t)s_freq.QuadPart;
+#elif defined(__APPLE__) && defined(__aarch64__)
+    /* The counter itself: an SPU polling its decrementer reads this constantly, and
+     * clock_gettime took 5% of FMOD's mixer. */
+    static uint64_t s_freq;
+    uint64_t t;
+    __asm__ volatile("mrs %0, cntvct_el0" : "=r"(t));
+    if (!s_freq) __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(s_freq));
+    return (t / s_freq) * 1000000000ull + (t % s_freq) * 1000000000ull / s_freq;
 #else
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -1518,8 +1526,31 @@ int spu_have_function(uint32_t addr)
  * (spu_interp.c, rejoin path). It IS the registry lookup, so overlay eviction and
  * self-modifying-code invalidation are honored automatically. Lived in
  * spu_fn_registry.c before the registry was consolidated into this TU. */
+/* The resident image whose code is at this address now, or 0: it must still hold
+ * the bytes the image was loaded from. */
+int spu_resident_owner(const spu_context* ctx, uint32_t lsa)
+{
+    for (unsigned slot = 0; slot < 4; ++slot) {
+        const uint32_t base = ctx->resident_code[slot].lsa;
+        if (!ctx->resident_code[slot].image_id || lsa < base ||
+            lsa - base >= ctx->resident_code[slot].size)
+            continue;
+        if (memcmp(ctx->ls + lsa, vm_base + ctx->resident_code[slot].source_ea + (lsa - base), 4) == 0)
+            return ctx->resident_code[slot].image_id;
+    }
+    return 0;
+}
+
 spu_lifted_fn spu_lifted_lookup(const spu_context* ctx, uint32_t lsa)
 {
+    /* Code resident at this address wins, as in spu_indirect_branch. Without this
+     * the interpreter could never hand back to a lifted overlay: Deadpool's FMOD
+     * mixer reaches its DSP plugins from interpreted code, and ran them all
+     * interpreted, too slow to mix in real time. */
+    if (ctx) {
+        const int owner = spu_resident_owner(ctx, lsa);
+        if (owner) return (spu_lifted_fn)spu_lookup(lsa, owner);
+    }
     return (spu_lifted_fn)spu_lookup(lsa, ctx ? ctx->image_id : 0);
 }
 
@@ -1636,6 +1667,16 @@ static int spu_taskset_resident_image(const spu_context* ctx)
 /* Content-signature variant: FMOD COPIES codec overlays to the heap before
  * streaming them into the swap slot, so the source EA is unknowable ahead of
  * time -- match the first 16 bytes of the streamed content instead. */
+/* A bounded code image found by its first bytes, for one loaded from a file to an
+ * address that changes between runs. Translated at its local-store address. */
+void spu_overlay_register_sig_region(const uint8_t sig[16], uint32_t span, int image_id)
+{
+    if (!span || span > SPU_LS_SIZE || s_ovl_src_count >= SPU_OVL_SRC_MAX) return;
+    extern void spu_overlay_register_sig(const uint8_t[16], int);
+    spu_overlay_register_sig(sig, image_id);
+    s_ovl_src[s_ovl_src_count - 1].span = span;
+}
+
 void spu_overlay_register_sig(const uint8_t sig[16], int image_id)
 {
     if (s_ovl_src_count < SPU_OVL_SRC_MAX) {
@@ -1705,14 +1746,6 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
 {
     uint32_t lsa = (uint32_t)(ls - ctx->ls);
     spu_ovl_dump(ctx, ea, lsa, ls, size);
-    for (unsigned slot = 0; slot < 4; ++slot) {
-        if (!ctx->resident_code[slot].image_id) continue;
-        uint32_t base = ctx->resident_code[slot].lsa;
-        uint32_t end = base + ctx->resident_code[slot].size;
-        if (lsa < end && lsa + size > base &&
-            (lsa < base || ea != ctx->resident_code[slot].source_ea + (lsa - base)))
-            ctx->resident_code[slot].image_id = 0;
-    }
     for (int i = 0; i < s_ovl_src_count; i++) {
         const spu_ovl_src* o = &s_ovl_src[i];
         int hit = o->has_sig ? (size >= 512 && memcmp(ls, o->sig, 16) == 0)
@@ -1720,16 +1753,23 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
         if (hit) {
             if (o->span) {
                 if (lsa + o->span > SPU_LS_SIZE) return;
-                for (unsigned slot = 0; slot < 4; ++slot) {
-                    if (ctx->resident_code[slot].image_id && ctx->resident_code[slot].lsa != lsa)
-                        continue;
-                    ctx->resident_code[slot].lsa = lsa;
-                    ctx->resident_code[slot].size = o->span;
-                    ctx->resident_code[slot].source_ea = ea;
-                    ctx->resident_code[slot].image_id = o->image_id;
-                    return;
-                }
-                fprintf(stderr, "[spu-ovl] no free resident code span for image %d\n", o->image_id);
+                /* The same address, else a free slot, else one this image lands on:
+                 * a slot overlapped by something else is only found stale at lookup
+                 * (spu_resident_owner), since a mixer can load data over part of a
+                 * module's span and keep running the rest. */
+                unsigned use = 4;
+                for (unsigned slot = 0; slot < 4 && use == 4; ++slot)
+                    if (ctx->resident_code[slot].image_id && ctx->resident_code[slot].lsa == lsa) use = slot;
+                for (unsigned slot = 0; slot < 4 && use == 4; ++slot)
+                    if (!ctx->resident_code[slot].image_id) use = slot;
+                for (unsigned slot = 0; slot < 4 && use == 4; ++slot)
+                    if (lsa < ctx->resident_code[slot].lsa + ctx->resident_code[slot].size &&
+                        lsa + o->span > ctx->resident_code[slot].lsa) use = slot;
+                if (use == 4) use = 0;
+                ctx->resident_code[use].lsa = lsa;
+                ctx->resident_code[use].size = o->span;
+                ctx->resident_code[use].source_ea = ea;
+                ctx->resident_code[use].image_id = o->image_id;
                 return;
             }
             if (ctx->resident_ovl != o->image_id) {
@@ -2326,14 +2366,8 @@ void spu_indirect_branch(spu_context* ctx)
      * is 0 outside the region, so this only ever fires for genuine task code.) */
     spu_fn fn = NULL;
     int code_owner = 0;
-    for (unsigned slot = 0; slot < 4; ++slot) {
-        if (ctx->resident_code[slot].image_id && ctx->pc >= ctx->resident_code[slot].lsa &&
-            ctx->pc - ctx->resident_code[slot].lsa < ctx->resident_code[slot].size) {
-            code_owner = ctx->resident_code[slot].image_id;
-            fn = spu_lookup(ctx->pc, code_owner);
-            break;
-        }
-    }
+    code_owner = spu_resident_owner(ctx, (uint32_t)ctx->pc);
+    if (code_owner) fn = spu_lookup(ctx->pc, code_owner);
     if (!code_owner && ctx->resident_task)
         fn = spu_lookup(ctx->pc, ctx->resident_task);
     /* Resident overlay next: streamed code overwrote that LS range, so its lift
@@ -2445,6 +2479,12 @@ void spu_indirect_branch(spu_context* ctx)
                   fprintf(stderr, "[spu] img=%d interpreting unlifted LS 0x%05X "
                           "(runtime-loaded code)\n", ctx->image_id, p);
               spu_interp_run(ctx, p);
+              /* It stopped because it reached lifted code: that is a transfer,
+               * not a host return, and a top-level driver would end the run on
+               * an empty trampoline (see the same case in the SMC path). */
+              if (ctx->image_id >= 0 && (ctx->status & SPU_STATUS_RUNNING) &&
+                  spu_lifted_lookup(ctx, ctx->pc))
+                  g_spu_trampoline_fn = spu_indirect_branch;
               return;
           } }
         spu_halt(ctx);

@@ -445,6 +445,35 @@ uint32_t spu_interp_run_until(spu_context* ctx, uint32_t start_lsa, uint32_t sto
         }
         if (_tr>0) { ring[rc&63]=ctx->pc; rc++; if(rn<64)rn++; }
         steps++;
+        /* SPU_INTERP_ENTRIES=<file>: every address the interpreter jumped to, by the
+         * image resident there, rewritten now and then. A lift of code reached through
+         * tables finds few of its functions by itself; these are the rest, to give the
+         * lifter as --extra-funcs. */
+        { static const char* path = (const char*)-1;
+          enum { EI_IMAGES = 128, EI_WORDS = 0x10000 };
+          static uint8_t (*seen)[EI_WORDS]; static _Thread_local uint32_t last = 0xFFFFFFFFu;
+          static uint64_t count;
+          if (path == (const char*)-1) { path = getenv("SPU_INTERP_ENTRIES");
+              if (path) seen = calloc(EI_IMAGES, EI_WORDS); }
+          if (path && seen) {
+              const uint32_t pc = ctx->pc & 0x3FFFC;
+              if (pc != last + 4) {
+                  extern int spu_resident_owner(const spu_context*, uint32_t);
+                  const int owner = spu_resident_owner(ctx, pc);
+                  int img = owner ? owner : ctx->image_id;
+                  if (img >= 0 && img < EI_IMAGES) seen[img][pc >> 2] = 1;
+              }
+              last = pc;
+              if ((++count & 0x7FFFFFFu) == 0) {
+                  FILE* f = fopen(path, "w");
+                  if (f) {
+                      for (int i = 0; i < EI_IMAGES; i++)
+                          for (uint32_t w = 0; w < EI_WORDS; w++)
+                              if (seen[i][w]) fprintf(f, "%d 0x%05X\n", i, w << 2);
+                      fclose(f);
+                  }
+              }
+          } }
         /* SPU_INTERP_STATS=<seconds>: how much SPU code runs interpreted, by
          * image and 1 KB page of local store. A job module streamed in at an
          * address nothing was lifted for runs here at a fraction of the
