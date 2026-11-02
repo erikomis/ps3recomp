@@ -39,6 +39,7 @@ uint32_t g_ydkj_real_spurs_ea   = 0;   /* real CellSpurs instance EA (for the ta
 #else
 #include <pthread.h>
 #include <time.h>
+#include "../../runtime/ppu/ppu_context.h"
 #endif
 
 /* ---------------------------------------------------------------------------
@@ -1560,13 +1561,26 @@ s32 _cellSpursWorkloadAttributeInitialize(u64 attr_ea, u32 revision, u32 sdkVers
         *(vm_base + (u32)attr_ea + WKATTR_PRIORITY + i) =
             prio_ea ? *(vm_base + (u32)prio_ea + i) : 0;
     vm_write32((u32)attr_ea + WKATTR_MIN_CONT, minContention);
-    vm_write32((u32)attr_ea + WKATTR_MAX_CONT, 1);   /* 9th arg is beyond the 8-GPR adapter */
+    /* maxContention is the 9th argument: past the 8-GPR adapter, in the caller's
+     * parameter save area. Writing 1 here kept a job queue on one SPU whatever the
+     * title asked for, and its geometry jobs became the whole frame's limit. */
+    {
+        extern PPU_THREAD_LOCAL ppu_context* g_active_ctx;
+        u32 maxContention = g_active_ctx ? (u32)vm_read64((u32)g_active_ctx->gpr[1] + 112u) : 1u;
+        if (!maxContention || maxContention > 8u) maxContention = 1u;
+        /* SPURS_MAX_CONTENTION=<n>: a ceiling for hosts with few fast cores. These
+         * workers spin at full speed while they wait for work. */
+        { const char* e = getenv("SPURS_MAX_CONTENTION");
+          if (e && (u32)atoi(e) && (u32)atoi(e) < maxContention) maxContention = (u32)atoi(e); }
+        vm_write32((u32)attr_ea + WKATTR_MAX_CONT, maxContention);
+    }
     vm_write32((u32)attr_ea + WKATTR_NAME_CLASS, 0);
     vm_write32((u32)attr_ea + WKATTR_NAME_INST,  0);
     vm_write32((u32)attr_ea + WKATTR_HOOK,     0);
     vm_write32((u32)attr_ea + WKATTR_HOOK_ARG, 0);
-    printf("[cellSpurs] _WorkloadAttributeInitialize(attr=0x%08X pm=0x%08X size=%u data=0x%llX minC=%u)\n",
-           (u32)attr_ea, (u32)pm_ea, size, (unsigned long long)data, minContention);
+    printf("[cellSpurs] _WorkloadAttributeInitialize(attr=0x%08X pm=0x%08X size=%u data=0x%llX minC=%u maxC=%u)\n",
+           (u32)attr_ea, (u32)pm_ea, size, (unsigned long long)data, minContention,
+           vm_read32((u32)attr_ea + WKATTR_MAX_CONT));
     return CELL_OK;
 }
 
@@ -3457,6 +3471,14 @@ s32 cellSpursQueueAttachLv2EventQueue(u64 queue_ea)
 {
     static int _n = 0;
     if (PS3_LOG_FIRST(_n, 8)) printf("[cellSpurs] QueueAttachLv2EventQueue(q=0x%08X)\n", (u32)queue_ea);
+    return CELL_OK;
+}
+
+/* The other end of the above: nothing was bound, so nothing to release. A title
+ * calls it from its queue teardown on each level change. */
+s32 cellSpursQueueDetachLv2EventQueue(u64 queue_ea)
+{
+    (void)queue_ea;
     return CELL_OK;
 }
 
