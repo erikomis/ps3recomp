@@ -876,7 +876,16 @@ static DWORD WINAPI spu_async_thread(LPVOID p) {
     return 0;
 }
 #else
-static void* spu_async_thread(void* p) { spu_async_run((spu_async_job*)p); return NULL; }
+static void* spu_async_thread(void* p)
+{
+#ifdef __APPLE__
+    /* An SPU is real-time hardware: keep its thread off the efficiency cores. A
+     * mixer that fits its 21 ms tick on a performance core misses it on those. */
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+#endif
+    spu_async_run((spu_async_job*)p);
+    return NULL;
+}
 #endif
 
 int spu_workload_dispatch_job(const uint8_t* image, uint32_t image_size,

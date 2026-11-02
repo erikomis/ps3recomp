@@ -1545,6 +1545,9 @@ static int s_spu_blk_w = 0;
 /* EA -> IO through the mapping list (range lookup; the by-ea helper is exact). */
 static u32 gcm_ea2io_range(u32 ea, u32* room)
 {
+    /* Every SPU PUT asks: answer the common "not RSX memory" from the page table
+     * rather than walking all the mappings. */
+    if (s_io_address_table[ea >> 20] == 0xFFFFu) return 0xFFFFFFFFu;
     for (int i = 0; i < CELL_GCM_MAX_IO_MAPPINGS; i++) {
         IoMapping* m = &s_io_mappings[i];
         if (!m->active || !m->size) continue;
