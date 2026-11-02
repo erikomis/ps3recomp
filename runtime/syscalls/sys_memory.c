@@ -113,14 +113,21 @@ int64_t sys_memory_allocate(ppu_context* ctx)
     uint32_t size = (uint32_t)rounded;
     bump_lock();
     if (size > SYS_MEM_USER_TOTAL - s_total_allocated) {
-        bump_unlock(); return (int64_t)(int32_t)CELL_ENOMEM;
+        uint32_t used = s_total_allocated;
+        bump_unlock();
+        fprintf(stderr, "[sys_memory] allocate(size=0x%X) -> ENOMEM: 0x%X of 0x%X user bytes in use\n",
+                size, used, (uint32_t)SYS_MEM_USER_TOTAL);
+        return (int64_t)(int32_t)CELL_ENOMEM;
     }
     int slot = -1;
     for (int i = 0; i < SYS_MEMORY_ALLOC_MAX; ++i)
         if (!g_sys_mem_allocs[i].active) { slot = i; break; }
     uint32_t addr = slot < 0 ? 0 : user_address(size, alignment);
     if (!addr || vm_commit(addr, size) != CELL_OK) {
-        bump_unlock(); return (int64_t)(int32_t)CELL_ENOMEM;
+        bump_unlock();
+        fprintf(stderr, "[sys_memory] allocate(size=0x%X) -> ENOMEM: no %s\n", size,
+                slot < 0 ? "free allocation slot" : "address range below 0x20000000");
+        return (int64_t)(int32_t)CELL_ENOMEM;
     }
     memset(vm_to_host(addr), 0, size);
     sys_mem_alloc_info* a = &g_sys_mem_allocs[slot];
@@ -210,7 +217,10 @@ int64_t sys_memory_get_page_attribute(ppu_context* ctx)
         write_be32(attr_out + 0x00, 0);          /* attribute    (hi) */
         write_be32(attr_out + 0x04, 0x00040000); /* attribute    (lo) PROT_READ_WRITE-ish */
         write_be32(attr_out + 0x08, 0);          /* access_right (hi) */
-        write_be32(attr_out + 0x0C, 0x00000008); /* access_right (lo) PPU_THREAD-ish */
+        /* Only the 0xDxxxxxxx stacks are PPU-private (ACCESS_RIGHT_PPU_THR); the rest
+         * is reachable by every kind of thread (ANY). libspurs_jq refuses a job queue
+         * in memory an SPU cannot reach (0x80410A02). */
+        write_be32(attr_out + 0x0C, (addr >> 28) == 0xDu ? 0x00000008u : 0x0000000Fu); /* access_right (lo) */
         write_be32(attr_out + 0x10, page_size);  /* page_size */
         write_be32(attr_out + 0x14, 0);          /* pad */
     }
