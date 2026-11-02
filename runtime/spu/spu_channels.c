@@ -301,6 +301,7 @@ typedef struct spu_mfc_slot {
 
 static spu_mfc_slot* s_mfc_slots;
 static SRWLOCK s_mfc_claim_lock = SRWLOCK_INIT;
+static mfc_engine* mfc_for_slow(spu_context* ctx);
 
 /* SPU_PCSAMPLE=<secs>: every <secs>, print image and pc of every context
  * holding an MFC slot -- i.e. every live SPU that has done DMA. Answers
@@ -325,7 +326,24 @@ static DWORD WINAPI spu_pcsample_thread(LPVOID p)
     }
 }
 
+/* Each thread's last answer, while the slot list has not lost an entry. This runs on
+ * every MFC channel access: the shared lock and the list walk took a quarter of the
+ * time of Deadpool's job queue thread. */
+static volatile uint32_t s_mfc_slots_gen;
+
 static mfc_engine* mfc_for(spu_context* ctx)
+{
+    static SPU_THREAD_LOCAL spu_context* t_ctx;
+    static SPU_THREAD_LOCAL mfc_engine* t_mfc;
+    static SPU_THREAD_LOCAL uint32_t t_gen;
+    const uint32_t gen = __atomic_load_n(&s_mfc_slots_gen, __ATOMIC_ACQUIRE);
+    if (t_ctx == ctx && t_gen == gen) return t_mfc;
+    mfc_engine* const found = mfc_for_slow(ctx);
+    t_ctx = ctx; t_mfc = found; t_gen = gen;
+    return found;
+}
+
+static mfc_engine* mfc_for_slow(spu_context* ctx)
 {
     { static volatile LONG started = 0;
       /* One-shot: flip the flag regardless of the lookup result, so the hot
@@ -376,6 +394,7 @@ void spu_mfc_release(spu_context* ctx)
         if ((*link)->ctx != ctx) continue;
         spu_mfc_slot* slot = *link;
         *link = slot->next;
+        __atomic_fetch_add(&s_mfc_slots_gen, 1, __ATOMIC_RELEASE);
         free(slot);
         break;
     }
@@ -392,6 +411,7 @@ void spu_mfc_forget_range(uintptr_t lo, uintptr_t hi)
         uintptr_t owner = (uintptr_t)slot->ctx;
         if (owner >= lo && owner < hi) {
             *link = slot->next;
+            __atomic_fetch_add(&s_mfc_slots_gen, 1, __ATOMIC_RELEASE);
             free(slot);
         } else {
             link = &slot->next;
