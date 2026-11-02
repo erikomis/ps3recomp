@@ -1069,6 +1069,76 @@ static void gcm_row_copy(u32 d, u32 s, u32 n)
     spu_lockline_unlock();
 }
 
+/* GCM_STD_SUBCHANNELS=1: the title keeps libgcm's bindings, where only subchannel
+ * 0 is NV4097 and subchannel 1 is NV0039. SET_OBJECT is not tracked, and other
+ * titles bind NV4097 on subchannel 1, hence the switch. Without it Deadpool's
+ * memory copies never ran, and their parameters landed in the 3D registers: its
+ * NV0039 FORMAT 0x101 became COLOR_MASK (green and blue only), which left the red
+ * channel of the post-process targets behind by a frame. */
+static int gcm_std_subchannels(void)
+{
+    static int on = -1;
+    if (on < 0) on = getenv("GCM_STD_SUBCHANNELS") ? 1 : 0;
+    return on;
+}
+
+/* NV0039, memory to memory. Lines of bytes between local memory and main memory;
+ * the copy runs when BUFFER_NOTIFY arrives. */
+static struct {
+    u32 in_dma, out_dma, off_in, off_out, pitch_in, pitch_out, line_len, line_count, format;
+} s_nv0039;
+
+static void nv0039_copy(void)
+{
+    const u32 len = s_nv0039.line_len, lines = s_nv0039.line_count;
+    if (!len || !lines) return;
+    if (s_nv0039.format != 0x101u) {
+        static int n = 0;
+        if (PS3_LOG_FIRST(n, 4))
+            fprintf(stderr, "[NV0039] format 0x%X unsupported, copy dropped\n", s_nv0039.format);
+        return;
+    }
+    const u32 pin = s_nv0039.pitch_in ? s_nv0039.pitch_in : len;
+    const u32 pout = s_nv0039.pitch_out ? s_nv0039.pitch_out : len;
+    const int src_local = s_nv0039.in_dma != 0xFEED0001u && s_nv0039.in_dma != 0xBAD68000u;
+    const int dst_local = s_nv0039.out_dma != 0xFEED0001u && s_nv0039.out_dma != 0xBAD68000u;
+    const u32 src = cellGcmResolveLocated(src_local, s_nv0039.off_in);
+    const u32 dst = cellGcmResolveLocated(dst_local, s_nv0039.off_out);
+    if (!src || !dst) {
+        static int n = 0;
+        if (PS3_LOG_FIRST(n, 8))
+            fprintf(stderr, "[NV0039] unmapped copy %08X -> %08X (%ux%u)\n",
+                    s_nv0039.off_in, s_nv0039.off_out, len, lines);
+        return;
+    }
+    const u32 words = (len + 3u) / 4u;
+    if (rsx_draw_engine_enabled())
+        rsx_draw_engine_guest_read(src_local ? RSX_LOCATION_LOCAL : RSX_LOCATION_MAIN,
+                                   s_nv0039.off_in, pin, words, lines);
+    for (u32 y = 0; y < lines; y++)
+        gcm_row_copy(dst + y * pout, src + y * pin, len);
+    if (rsx_draw_engine_enabled())
+        rsx_draw_engine_guest_wrote(dst_local ? RSX_LOCATION_LOCAL : RSX_LOCATION_MAIN,
+                                    s_nv0039.off_out, pout, words, lines);
+}
+
+static void nv0039_method(u32 method, u32 data)
+{
+    switch (method) {
+    case 0x0184: s_nv0039.in_dma = data; return;
+    case 0x0188: s_nv0039.out_dma = data; return;
+    case 0x030C: s_nv0039.off_in = data; return;
+    case 0x0310: s_nv0039.off_out = data; return;
+    case 0x0314: s_nv0039.pitch_in = data; return;
+    case 0x0318: s_nv0039.pitch_out = data; return;
+    case 0x031C: s_nv0039.line_len = data; return;
+    case 0x0320: s_nv0039.line_count = data; return;
+    case 0x0324: s_nv0039.format = data; return;
+    case 0x0328: nv0039_copy(); return;
+    default: return;
+    }
+}
+
 static void nv3089_blit(void)
 {
     u32 out_w = s_nv3089.out_sz & 0xFFFF, out_h = s_nv3089.out_sz >> 16;
@@ -2310,7 +2380,9 @@ static void gcm_rsx_process_fifo_unlocked(void)
                  * same reason the live engine does, and masks them itself. */
                 { static int eng = -1;
                   if (eng < 0) eng = rsx_draw_engine_enabled();
-                  if (eng) rsx_draw_engine_method((subch << 13) | m, vm_read32(dea)); }
+                  if (eng && (!gcm_std_subchannels() || subch == 0 ||
+                              ((subch << 13) | m) >= 0xE000u))
+                      rsx_draw_engine_method((subch << 13) | m, vm_read32(dea)); }
 
                 /* RSX_LIVE_FEED_DBG=1: what the FIFO actually carries. Counted
                  * for any run, live engine or not, so the method stream and the
@@ -2337,6 +2409,8 @@ static void gcm_rsx_process_fifo_unlocked(void)
                     cellGcmQueueUserCommand(vm_read32(dea));
                 } else if (mfull == 0xE920u || mfull == 0xE924u) {
                     cellGcmSetFlipCommand(vm_read32(dea) & 7u);
+                } else if (subch == 1 && gcm_std_subchannels()) {
+                    nv0039_method(m, vm_read32(dea));
                 } else if (subch == 0 || (subch == 1 && !s1_2d)) {
                     rsx_process_method(&s_state, m, vm_read32(dea));
                     /* NV406E_SET_REFERENCE: queue the fence value for PACED

@@ -2075,6 +2075,35 @@ static u32 eng_color_feedback_failure(u32 unit, const eng_surface* s,
     return ENG_INVALID;
 }
 
+/* A texture smaller than the target at its offset, on the target's pitch, is that
+ * target's top-left corner: RSX addresses it by memory. Deadpool draws half-size
+ * scene colour into the corner of its 1024x600 target and samples it as 512x300;
+ * binding the whole target put the full image in the tonemap's half-size input. */
+static int eng_texture_is_corner(const eng_surface* s, const rsx_dsp_texture* t)
+{
+    return g.be->color_snapshot_rect && t->pitch && t->pitch == s->pitch &&
+           t->width && t->height && t->width <= s->w && t->height <= s->h &&
+           (t->width < s->w || t->height < s->h);
+}
+
+/* A copy of that corner, taken again whenever the target has been written. */
+static int eng_surface_corner(eng_surface* s, const rsx_dsp_texture* t, u32* out)
+{
+    if (!s->part || s->part_w != t->width || s->part_h != t->height ||
+        s->part_serial != s->color_serial) {
+        const u32 copy = g.be->color_snapshot_rect(g.be->user, s->handle, t->width, t->height);
+        if (!copy) return 0;
+        if (s->part) g.be->texture_release(g.be->user, s->part);
+        s->part = copy; s->part_w = t->width; s->part_h = t->height;
+        s->part_serial = s->color_serial;
+    }
+    const u32 view = g.be->surface_view
+        ? g.be->surface_view(g.be->user, s->part, t->remap & 0xFFFFu, t->format)
+        : 0;
+    *out = view ? view : s->part;
+    return 1;
+}
+
 static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
                               u32 current_zslot, u32 tex_used,
                               u32 textures[RSX_BE_MAX_TEXTURES],
@@ -2132,6 +2161,10 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
                 continue;
             }
         }
+        /* The corner of a target being drawn into: a copy of that part, as below. */
+        if (own && zsrc < 0 && eng_texture_is_corner(&g.surfaces[surface_at], &t) &&
+            eng_surface_corner(&g.surfaces[surface_at], &t, &textures[u]))
+            continue;
         if (own && zsrc < 0 && g.be->color_snapshot) {
             eng_surface* s = &g.surfaces[surface_at];
             rsx_dsp_surface sf;
@@ -2168,33 +2201,9 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
                                        (t.dimension == 3 && !t.cubemap) ? t.depth : 1u);
             continue;
         }
-        /* A texture smaller than the target at its offset, on the target's pitch,
-         * is that target's top-left corner: RSX addresses it by memory. Deadpool
-         * draws half-size scene colour into the corner of its 1024x600 target and
-         * samples it as 512x300; binding the whole target put the full image in
-         * the tonemap's half-size input. */
-        if (sampled >= 0 && g.be->color_snapshot_rect && t.pitch &&
-            t.pitch == g.surfaces[sampled].pitch && t.width && t.height &&
-            t.width <= g.surfaces[sampled].w && t.height <= g.surfaces[sampled].h &&
-            (t.width < g.surfaces[sampled].w || t.height < g.surfaces[sampled].h)) {
-            eng_surface* s = &g.surfaces[sampled];
-            if (!s->part || s->part_w != t.width || s->part_h != t.height ||
-                s->part_serial != s->color_serial) {
-                const u32 copy = g.be->color_snapshot_rect(g.be->user, s->handle, t.width, t.height);
-                if (copy) {
-                    if (s->part) g.be->texture_release(g.be->user, s->part);
-                    s->part = copy; s->part_w = t.width; s->part_h = t.height;
-                    s->part_serial = s->color_serial;
-                }
-            }
-            if (s->part && s->part_w == t.width && s->part_h == t.height) {
-                const u32 view = g.be->surface_view
-                    ? g.be->surface_view(g.be->user, s->part, t.remap & 0xFFFFu, t.format)
-                    : 0;
-                textures[u] = view ? view : s->part;
-                continue;
-            }
-        }
+        if (sampled >= 0 && eng_texture_is_corner(&g.surfaces[sampled], &t) &&
+            eng_surface_corner(&g.surfaces[sampled], &t, &textures[u]))
+            continue;
         if (sampled >= 0) {
             const u32 view = g.be->surface_view
                 ? g.be->surface_view(g.be->user, g.surfaces[sampled].handle,
