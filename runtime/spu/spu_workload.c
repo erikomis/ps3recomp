@@ -876,7 +876,16 @@ static DWORD WINAPI spu_async_thread(LPVOID p) {
     return 0;
 }
 #else
-static void* spu_async_thread(void* p) { spu_async_run((spu_async_job*)p); return NULL; }
+static void* spu_async_thread(void* p)
+{
+#ifdef __APPLE__
+    /* An SPU is real-time hardware: keep its thread off the efficiency cores. A
+     * mixer that fits its 21 ms tick on a performance core misses it on those. */
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+#endif
+    spu_async_run((spu_async_job*)p);
+    return NULL;
+}
 #endif
 
 int spu_workload_dispatch_job(const uint8_t* image, uint32_t image_size,
@@ -1078,6 +1087,41 @@ int spu_taskset_consume_wake(uint32_t taskset_ea)
 }
 
 /* Signal every task of `taskset_ea` currently parked. Returns how many. */
+/* Signal every task parked on `wait_obj` (whatever its taskset). A task that
+ * named no object (0 recorded) matches anything.
+ *
+ * _cellSpursLFQueuePushBody knows only the queue EA, not the taskset; the
+ * consumer task parks with the queue as its wait object (LS 0x2FDC). The push
+ * tries this first and falls back to spu_taskset_signal_parked_force().
+ * (Ported from the Resistance 2 tree, where it fixed the Wws_Job queue.) */
+int spu_taskset_signal_parked_obj_any(uint32_t wait_obj)
+{
+    int n = 0;
+    for (int i = 0; i < SPU_PARKED_MAX; i++) {
+        uint64_t k = s_parked[i];
+        if (!k) continue;
+        if (s_parked_obj[i] && s_parked_obj[i] != wait_obj) continue;
+        spu_taskset_signal_task((uint32_t)(k >> 32), (uint32_t)(k & 0xFFFFFFFFu) - 1u);
+        n++;
+    }
+    return n;
+}
+
+/* Signal EVERY task parked in WAIT_SIGNAL. The push handler's fallback: an
+ * unread entry sitting in the queue while its only consumer sleeps is the
+ * worse state to be left in. */
+int spu_taskset_signal_parked_force(void)
+{
+    int n = 0;
+    for (int i = 0; i < SPU_PARKED_MAX; i++) {
+        uint64_t k = s_parked[i];
+        if (!k) continue;
+        spu_taskset_signal_task((uint32_t)(k >> 32), (uint32_t)(k & 0xFFFFFFFFu) - 1u);
+        n++;
+    }
+    return n;
+}
+
 /* Wake only the task parked on `wait_obj` (0 = any task of the taskset).
  * The guest names its wait object in the WAIT_SIGNAL argument, and for YDKJ`s
  * CRI tasks the flag the PPU sets is exactly wait_obj + 0x80 -- so a Set can

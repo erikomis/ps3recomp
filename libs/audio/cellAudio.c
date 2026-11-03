@@ -208,12 +208,21 @@ static void audio_backend_submit(const float* stereo_samples, u32 num_samples)
     }
 }
 
-/* SDL queues without bound: keep about four blocks ahead of the device. */
+/* AUDIO_ELASTIC=1: see audio_late_block. */
+static int audio_elastic(void)
+{
+    static int on = -1;
+    if (on < 0) on = getenv("AUDIO_ELASTIC") ? 1 : 0;
+    return on;
+}
+
+/* SDL queues without bound: keep about four blocks ahead of the device, or eight
+ * when the mixer may wait for a late block out of that margin. */
 static int audio_backend_room(void)
 {
     if (!s_sdl_audio_dev) return -1;
     return SDL_GetQueuedAudioSize(s_sdl_audio_dev) / (2 * sizeof(float)) <
-           CELL_AUDIO_BLOCK_SAMPLES * 4 ? CELL_AUDIO_BLOCK_SAMPLES : 0;
+           CELL_AUDIO_BLOCK_SAMPLES * (audio_elastic() ? 8u : 4u) ? CELL_AUDIO_BLOCK_SAMPLES : 0;
 }
 
 static void audio_backend_wait(void) { SDL_Delay(1); }
@@ -553,6 +562,81 @@ static void audio_notify_event_queues(void)
     }
 }
 
+/* What the final mix holds, for either platform's mixing thread. */
+static unsigned long long audio_diag_ms(void)
+{
+#ifdef _WIN32
+    return GetTickCount64();
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (unsigned long long)ts.tv_sec * 1000ull + (unsigned long long)ts.tv_nsec / 1000000ull;
+#endif
+}
+
+#if AUDIO_BACKEND_SDL2
+/* A title's mixer that finishes its tick a few milliseconds late finds the read
+ * index past its block, and FMOD then loses most of a ring. While the device still
+ * has audio queued the mixer can wait for that block instead of playing it empty:
+ * a running port's cleared block with sound due, and no other port holding data. */
+static int audio_late_block(void)
+{
+    if (!audio_elastic() || audio_backend_queued_samples() < CELL_AUDIO_BLOCK_SAMPLES * 2)
+        return 0;
+    int running = 0, ready = 0;
+    mutex_lock(&s_audio_mutex);
+    for (int p = 0; p < CELL_AUDIO_PORT_MAX && !ready; p++) {
+        const AudioPortSlot* port = &s_ports[p];
+        if (!port->in_use || !port->running || !port->buffer) continue;
+        running = 1;
+        const u32 nch = (u32)port->param.nChannel;
+        const float* src = port->buffer +
+            (u32)(port->read_index % (u32)port->param.nBlock) * CELL_AUDIO_BLOCK_SAMPLES * nch;
+        for (u32 s = 0; s < CELL_AUDIO_BLOCK_SAMPLES * nch; s += nch)
+            if (src[s] != 0.0f) { ready = 1; break; }
+    }
+    mutex_unlock(&s_audio_mutex);
+    return running && !ready;
+}
+#endif
+
+static void audio_diag_before_submit(void)
+{
+        /* AUDIO_PEAK=1: report the mixed block's peak amplitude periodically so
+         * "is any port producing sound" is answerable (LBP Bink movie audio). */
+        { static int _ap = -1; if (_ap < 0) _ap = getenv("AUDIO_PEAK") ? 1 : 0;
+          if (_ap) { static unsigned _n = 0; float pk = 0.0f;
+            for (u32 i = 0; i < CELL_AUDIO_BLOCK_SAMPLES * 2; i++) {
+                float a = s_mix_buffer[i]; if (a < 0) a = -a; if (a > pk) pk = a; }
+            if ((++_n % 200) == 0 || (pk > 0.001f && _n < 40))
+                fprintf(stderr, "[audio-peak] block#%u peak=%.4f\n", _n, pk); } }
+        /* AUDIO_WAV=<file>: append the final mix as raw f32le stereo 48 kHz
+         * (ffmpeg -f f32le -ar 48000 -ac 2 -i <file>). */
+        { static FILE* _wf = (FILE*)-1;
+          if (_wf == (FILE*)-1) { const char* e = getenv("AUDIO_WAV"); _wf = e ? fopen(e, "wb") : NULL; }
+          if (_wf) fwrite(s_mix_buffer, sizeof(float), CELL_AUDIO_BLOCK_SAMPLES * 2, _wf); }
+}
+
+static void audio_diag_after_submit(void)
+{
+        /* AUDIO_RATE=1: blocks mixed vs real time, and frames dropped. */
+        { static int on = -1; if (on < 0) on = getenv("AUDIO_RATE") ? 1 : 0;
+          if (on) { static unsigned long long t0; static unsigned n, z; static unsigned long long d0;
+            unsigned long long now = audio_diag_ms(); if (!t0) t0 = now; n++;
+            { int nz = 0; for (u32 i = 0; i < CELL_AUDIO_BLOCK_SAMPLES * 2; i++) if (s_mix_buffer[i] != 0.0f) { nz = 1; break; }
+              if (!nz) z++; }
+            if (now - t0 >= 5000) {
+                fprintf(stderr, "[audio-rate] %.1f blocks/s (real time 187.5), silent %.1f%%, dropped %.0f frames/s, device buf %u%c",
+                        n * 1000.0 / (now - t0), n ? 100.0 * z / n : 0.0, (g_audio_dropped - d0) * 1000.0 / (now - t0),
+                #if AUDIO_BACKEND_WASAPI
+                        (unsigned)s_wasapi_buf_frames, 10);
+#else
+                        0u, 10);
+#endif
+                n = z = 0; d0 = g_audio_dropped; t0 = now; } } }
+
+}
+
 #ifdef _WIN32
 static unsigned __stdcall audio_mix_thread_func(void* arg)
 {
@@ -584,35 +668,9 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
         blocks++;
         /* Mix and submit one block */
         audio_mix_one_block();
-        /* AUDIO_PEAK=1: report the mixed block's peak amplitude periodically so
-         * "is any port producing sound" is answerable (LBP Bink movie audio). */
-        { static int _ap = -1; if (_ap < 0) _ap = getenv("AUDIO_PEAK") ? 1 : 0;
-          if (_ap) { static unsigned _n = 0; float pk = 0.0f;
-            for (u32 i = 0; i < CELL_AUDIO_BLOCK_SAMPLES * 2; i++) {
-                float a = s_mix_buffer[i]; if (a < 0) a = -a; if (a > pk) pk = a; }
-            if ((++_n % 200) == 0 || (pk > 0.001f && _n < 40))
-                fprintf(stderr, "[audio-peak] block#%u peak=%.4f\n", _n, pk); } }
-        /* AUDIO_WAV=<file>: append the final mix as raw f32le stereo 48 kHz
-         * (ffmpeg -f f32le -ar 48000 -ac 2 -i <file>). */
-        { static FILE* _wf = (FILE*)-1;
-          if (_wf == (FILE*)-1) { const char* e = getenv("AUDIO_WAV"); _wf = e ? fopen(e, "wb") : NULL; }
-          if (_wf) fwrite(s_mix_buffer, sizeof(float), CELL_AUDIO_BLOCK_SAMPLES * 2, _wf); }
+        audio_diag_before_submit();
         audio_backend_submit(s_mix_buffer, CELL_AUDIO_BLOCK_SAMPLES);
-        /* AUDIO_RATE=1: blocks mixed vs real time, and frames dropped. */
-        { static int on = -1; if (on < 0) on = getenv("AUDIO_RATE") ? 1 : 0;
-          if (on) { static ULONGLONG t0; static unsigned n, z; static unsigned long long d0;
-            ULONGLONG now = GetTickCount64(); if (!t0) t0 = now; n++;
-            { int nz = 0; for (u32 i = 0; i < CELL_AUDIO_BLOCK_SAMPLES * 2; i++) if (s_mix_buffer[i] != 0.0f) { nz = 1; break; }
-              if (!nz) z++; }
-            if (now - t0 >= 5000) {
-                fprintf(stderr, "[audio-rate] %.1f blocks/s (real time 187.5), silent %.1f%%, dropped %.0f frames/s, device buf %u%c",
-                        n * 1000.0 / (now - t0), n ? 100.0 * z / n : 0.0, (g_audio_dropped - d0) * 1000.0 / (now - t0),
-                #if AUDIO_BACKEND_WASAPI
-                        (unsigned)s_wasapi_buf_frames, 10);
-#else
-                        0u, 10);
-#endif
-                n = z = 0; d0 = g_audio_dropped; t0 = now; } } }
+        audio_diag_after_submit();
 
         /* Notify event queues */
         audio_notify_event_queues();
@@ -626,18 +684,34 @@ static void* audio_mix_thread_func(void* arg)
 {
     (void)arg;
     printf("[cellAudio] Mixing thread started\n");
+#ifdef __APPLE__
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+#endif
 
+    /* Pace to the device clock, as the Windows loop does: one block every
+     * 5.33 ms, whenever the device has room. Fixed sleeps ran at whatever rate
+     * they happened to, so the title's mixer was woken unevenly and the queue
+     * either ran dry or grew without bound. With no device, pace on the clock. */
+    unsigned long long t0 = audio_diag_ms(), blocks = 0;
     while (s_mix_thread_running) {
-        audio_mix_one_block();
-        audio_backend_submit(s_mix_buffer, CELL_AUDIO_BLOCK_SAMPLES);
-        audio_notify_event_queues();
-
-        u32 queued = audio_backend_queued_samples();
-        if (queued > CELL_AUDIO_BLOCK_SAMPLES * 4) {
-            usleep(5000);
-        } else {
-            usleep(2000);
+        const int room = audio_backend_room();
+        if (room >= 0 && room < CELL_AUDIO_BLOCK_SAMPLES) { audio_backend_wait(); continue; }
+#if AUDIO_BACKEND_SDL2
+        if (audio_late_block()) { usleep(500); continue; }
+#endif
+        if (room < 0) {
+            const unsigned long long now = audio_diag_ms();
+            const unsigned long long due = t0 + blocks * CELL_AUDIO_BLOCK_SAMPLES * 1000ull / CELL_AUDIO_SAMPLE_RATE;
+            if (now < due) { usleep(1000); continue; }
+            /* More than 50 ms behind: drop the backlog rather than mix a burst. */
+            if (now - due > 50) t0 = now - blocks * CELL_AUDIO_BLOCK_SAMPLES * 1000ull / CELL_AUDIO_SAMPLE_RATE;
         }
+        blocks++;
+        audio_mix_one_block();
+        audio_diag_before_submit();
+        audio_backend_submit(s_mix_buffer, CELL_AUDIO_BLOCK_SAMPLES);
+        audio_diag_after_submit();
+        audio_notify_event_queues();
     }
 
     printf("[cellAudio] Mixing thread stopped\n");

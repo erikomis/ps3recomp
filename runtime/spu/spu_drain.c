@@ -60,8 +60,26 @@ unsigned spu_recent_pcs(uint32_t* out, unsigned max)
 
 void spu_task_launch_check(spu_context* ctx, void* fn)
 {
-    t_recent[t_recent_n++ & 31] = (uint32_t)ctx->pc & SPU_LS_MASK;
     extern void spu_check_stack_reset(spu_context*, void (*)(spu_context*));
+    /* This runs on every step of every SPU, so with no diagnostic asked for it does
+     * only the two real checks. The history below costs a thread-local access per
+     * step on macOS, which showed in a profile of FMOD's mixer. */
+    static int s_diag = -1;
+    if (s_diag < 0) s_diag = getenv("SPU_RECENT_PCS") || getenv("SPU_EXITTRACE") ||
+                             getenv("SPU_STEPTRACE") || getenv("SPU_JOBDRAIN") ||
+                             getenv("SPU_NO_LS0_END");
+    if (!s_diag) {
+        spu_check_stack_reset(ctx, (void (*)(spu_context*))fn);
+        if (ctx->steps++ && (ctx->pc & SPU_LS_MASK) == 0 && !ctx->policy_mode && ctx->image_id > 0) {
+            static int _n = 0;
+            if (PS3_LOG_FIRST(_n, 8))
+                fprintf(stderr, "[spurs-job] img=%d branched to LS 0 -- job complete\n",
+                        ctx->image_id);
+            spu_halt(ctx);
+        }
+        return;
+    }
+    t_recent[t_recent_n++ & 31] = (uint32_t)ctx->pc & SPU_LS_MASK;
     spu_check_stack_reset(ctx, (void (*)(spu_context*))fn);
     /* A SPURS job returning to LS 0 is finished -- its crt tail-jumps to the
      * resident job manager, and with the job loaded at 0 that lands on its own

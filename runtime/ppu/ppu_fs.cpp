@@ -793,7 +793,33 @@ static void cellFsMkdir(ppu_context* ctx)
     ctx->gpr[3] = CELL_OK;   /* existing dir is benign for boot */
 }
 static void cellFsRmdir(ppu_context* ctx)  { ctx->gpr[3] = CELL_OK; }
-static void cellFsUnlink(ppu_context* ctx) { ctx->gpr[3] = CELL_OK; }
+/* cellFsUnlink / cellFsRename resolve through host_path(), the same mapping
+ * cellFsOpen uses. Left to libs/filesystem/cellFs.c they resolved /dev_hdd0
+ * to ./gamedata/dev_hdd0 regardless of PS3_HDD0_ROOT, so a title that writes
+ * <file>.tmp through this layer and renames it into place (Unreal Engine 3's
+ * shader cache.toc) got ENOENT on every attempt and retried forever. */
+static void cellFsUnlink(ppu_context* ctx)
+{
+    char gpath[1024], hpath[1100];
+    guest_strcpy(gpath, (uint32_t)ctx->gpr[3], sizeof gpath);
+    host_path(hpath, sizeof hpath, gpath);
+    int r = remove(hpath);
+    if (getenv("PS3_FSLOG")) fprintf(stderr, "[fs] unlink '%s' -> '%s' (%s)\n", gpath, hpath, r == 0 ? "OK" : "missing");
+    ctx->gpr[3] = (r == 0) ? CELL_OK : (uint64_t)(int64_t)(int32_t)CELL_FS_ENOENT;
+}
+static void cellFsRename(ppu_context* ctx)
+{
+    char gfrom[1024], gto[1024], hfrom[1100], hto[1100];
+    guest_strcpy(gfrom, (uint32_t)ctx->gpr[3], sizeof gfrom);
+    guest_strcpy(gto,   (uint32_t)ctx->gpr[4], sizeof gto);
+    host_path(hfrom, sizeof hfrom, gfrom);
+    host_path(hto,   sizeof hto,   gto);
+    remove(hto);                       /* rename-over: Windows refuses an existing target */
+    int r = rename(hfrom, hto);
+    if (getenv("PS3_FSLOG") || r != 0)
+        fprintf(stderr, "[fs] rename '%s' -> '%s' (%s)\n", gfrom, gto, r == 0 ? "OK" : strerror(errno));
+    ctx->gpr[3] = (r == 0) ? CELL_OK : (uint64_t)(int64_t)(int32_t)CELL_FS_ENOENT;
+}
 static void cellFsFsync(ppu_context* ctx)
 {
     int fd = (int)(uint32_t)ctx->gpr[3];
@@ -940,6 +966,7 @@ extern "C" void ppu_fs_register(void)
     ps3_hle_register_ctx(ps3_compute_nid("cellFsMkdir"),    "cellFsMkdir",    cellFsMkdir);
     ps3_hle_register_ctx(ps3_compute_nid("cellFsRmdir"),    "cellFsRmdir",    cellFsRmdir);
     ps3_hle_register_ctx(ps3_compute_nid("cellFsUnlink"),   "cellFsUnlink",   cellFsUnlink);
+    ps3_hle_register_ctx(ps3_compute_nid("cellFsRename"),   "cellFsRename",   cellFsRename);
     ps3_hle_register_ctx(ps3_compute_nid("cellFsFsync"),    "cellFsFsync",    cellFsFsync);
     ps3_hle_register_ctx(ps3_compute_nid("cellFsGetFreeSize"),   "cellFsGetFreeSize",   cellFsGetFreeSize);
     ps3_hle_register_ctx(ps3_compute_nid("cellFsChmod"),         "cellFsChmod",         cellFsChmod);

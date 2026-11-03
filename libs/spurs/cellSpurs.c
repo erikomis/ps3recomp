@@ -39,6 +39,7 @@ uint32_t g_ydkj_real_spurs_ea   = 0;   /* real CellSpurs instance EA (for the ta
 #else
 #include <pthread.h>
 #include <time.h>
+#include "../../runtime/ppu/ppu_context.h"
 #endif
 
 /* ---------------------------------------------------------------------------
@@ -899,7 +900,11 @@ s32 cellSpursCreateTasksetWithAttribute(CellSpurs* spurs,
     const CellSpursTasksetAttribute* attr_h = GUEST_PTR(attr, const CellSpursTasksetAttribute*);
     u32 size = attr_h->tasksetSize;
     if (size != 0x1900u && size != 0x2900u) return (s32)0x80410902u;
-    return spurs_create_taskset(spurs, taskset, 0, NULL, 0, size);
+    /* Carry the attribute's argTaskset through: a task reads it as its second
+     * entry argument (r4), and a task created with a NULL CellSpursTaskArgument
+     * (Deadpool's gcmxk_kernel_task) finds all of its state through it. */
+    return spurs_create_taskset(spurs, taskset, attr_h->args, attr_h->priority,
+                                0, size);
 }
 
 s32 cellSpursDestroyTaskset(CellSpursTaskset* taskset)
@@ -1257,13 +1262,17 @@ s32 _cellSpursTasksetAttributeInitialize(CellSpursTasksetAttribute* attr,
                                          u32 revision, u32 sdkVersion, u64 argTaskset,
                                          u64 priority, u32 maxContention)
 {
-    (void)sdkVersion; (void)argTaskset; (void)priority; (void)maxContention;
+    (void)sdkVersion; (void)maxContention;
     if (!attr) return CELL_SPURS_TASK_ERROR_NULL_POINTER;
     attr = GUEST_PTR(attr, CellSpursTasksetAttribute*);
     memset(attr, 0, sizeof(CellSpursTasksetAttribute));
     attr->revision = revision ? revision : 1;
     attr->tasksetSize = CSTS_STRUCT_END;
-    printf("[cellSpurs] _TasksetAttributeInitialize(rev=%u)\n", revision);
+    attr->args = argTaskset;
+    if (priority && spurs_guest_range_valid((u32)priority, CELL_SPURS_MAX_SPU))
+        memcpy(attr->priority, vm_base + (u32)priority, CELL_SPURS_MAX_SPU);
+    printf("[cellSpurs] _TasksetAttributeInitialize(rev=%u argTaskset=0x%llX)\n",
+           revision, (unsigned long long)argTaskset);
     return CELL_OK;
 }
 
@@ -1552,13 +1561,26 @@ s32 _cellSpursWorkloadAttributeInitialize(u64 attr_ea, u32 revision, u32 sdkVers
         *(vm_base + (u32)attr_ea + WKATTR_PRIORITY + i) =
             prio_ea ? *(vm_base + (u32)prio_ea + i) : 0;
     vm_write32((u32)attr_ea + WKATTR_MIN_CONT, minContention);
-    vm_write32((u32)attr_ea + WKATTR_MAX_CONT, 1);   /* 9th arg is beyond the 8-GPR adapter */
+    /* maxContention is the 9th argument: past the 8-GPR adapter, in the caller's
+     * parameter save area. Writing 1 here kept a job queue on one SPU whatever the
+     * title asked for, and its geometry jobs became the whole frame's limit. */
+    {
+        extern PPU_THREAD_LOCAL ppu_context* g_active_ctx;
+        u32 maxContention = g_active_ctx ? (u32)vm_read64((u32)g_active_ctx->gpr[1] + 112u) : 1u;
+        if (!maxContention || maxContention > 8u) maxContention = 1u;
+        /* SPURS_MAX_CONTENTION=<n>: a ceiling for hosts with few fast cores. These
+         * workers spin at full speed while they wait for work. */
+        { const char* e = getenv("SPURS_MAX_CONTENTION");
+          if (e && (u32)atoi(e) && (u32)atoi(e) < maxContention) maxContention = (u32)atoi(e); }
+        vm_write32((u32)attr_ea + WKATTR_MAX_CONT, maxContention);
+    }
     vm_write32((u32)attr_ea + WKATTR_NAME_CLASS, 0);
     vm_write32((u32)attr_ea + WKATTR_NAME_INST,  0);
     vm_write32((u32)attr_ea + WKATTR_HOOK,     0);
     vm_write32((u32)attr_ea + WKATTR_HOOK_ARG, 0);
-    printf("[cellSpurs] _WorkloadAttributeInitialize(attr=0x%08X pm=0x%08X size=%u data=0x%llX minC=%u)\n",
-           (u32)attr_ea, (u32)pm_ea, size, (unsigned long long)data, minContention);
+    printf("[cellSpurs] _WorkloadAttributeInitialize(attr=0x%08X pm=0x%08X size=%u data=0x%llX minC=%u maxC=%u)\n",
+           (u32)attr_ea, (u32)pm_ea, size, (unsigned long long)data, minContention,
+           vm_read32((u32)attr_ea + WKATTR_MAX_CONT));
     return CELL_OK;
 }
 
@@ -2242,6 +2264,8 @@ static struct {
     u16 max_grab;
     int run_count;
     volatile long running;   /* 1 while a host thread walks this chain */
+    u32 resume_pc;           /* SPURS_JC_RESUME: the END this chain stopped at */
+    volatile long rerun;     /* SPURS_JC_RESUME: a Run arrived during the walk */
 } s_jobchains[MAX_JOBCHAINS];
 
 static void jc_dump_commands(const char* tag, u32 ea, int max_words)
@@ -2614,6 +2638,11 @@ static u64 spurs_event_data3_probe(void)
 
 static void jc_signal_done(u32 jc_ea, int job_index)
 {
+    /* SPURS_JC_NO_EVENTS=1: a title that tracks its jobs by a counter they write
+     * attached the queue for something else. Deadpool's handler on it takes data2
+     * as a slot and allocates per event, so these ran it out of memory. */
+    { static int off = -1; if (off < 0) off = getenv("SPURS_JC_NO_EVENTS") ? 1 : 0;
+      if (off) return; }
     /* Carry the job's mailbox answer in the completion event. On hardware the
      * SPU's outbound/interrupt mailbox is what the SPURS event delivers; a
      * synthetic payload means the caller reads back zero for whatever it
@@ -2667,9 +2696,23 @@ static void jc_signal_done(u32 jc_ea, int job_index)
     }
 }
 
-static void jc_execute(u32 entry_ea, u32 jc_ea, u32 size_desc)
+/* SPURS_JC_RESUME=1: Run continues where the chain stopped, instead of at its
+ * first command. Deadpool's chain is a ring: the PPU writes the next job over the
+ * END and calls Run, and the jobs behind that point have finished and their
+ * parameter blocks are gone. Walking from the start ran them again on freed
+ * memory (one read a size from it and swept the address space from EA 0). Other
+ * titles rebuild a list and Run it from the top each frame, hence the switch. */
+static int jc_resume_mode(void)
 {
-    u32 pc = entry_ea, ret_pc = 0;
+    static int on = -1;
+    if (on < 0) on = getenv("SPURS_JC_RESUME") ? 1 : 0;
+    return on;
+}
+
+static void jc_execute(int slot, u32 entry_ea, u32 jc_ea, u32 size_desc)
+{
+    u32 pc = (jc_resume_mode() && s_jobchains[slot].resume_pc) ? s_jobchains[slot].resume_pc : entry_ea;
+    u32 ret_pc = 0;
     int jobs = 0;
     /* Bound IDLE steps, not total steps. A SPURS job chain is frequently a
      * SERVICE LOOP -- guard, job, sync, next, repeat -- and is meant to run for
@@ -2703,7 +2746,9 @@ static void jc_execute(u32 entry_ea, u32 jc_ea, u32 size_desc)
         if (op == 4) { ret_pc = pc + 8; pc = (u32)(cmd & ~7ull); continue; }  /* CALL */
         if (op == 7) {
             if (ext == (7 | (15 << 3))) {                     /* END */
-                printf("[cellSpurs] chain 0x%08X: END after %d job(s)\n", jc_ea, jobs);
+                { static int _n = 0; if (PS3_LOG_FIRST(_n, 8))
+                    printf("[cellSpurs] chain 0x%08X: END after %d job(s)\n", jc_ea, jobs); }
+                s_jobchains[slot].resume_pc = pc;
                 if (jobs) jc_signal_done(jc_ea, jobs - 1);
                 return;
             }
@@ -2740,12 +2785,20 @@ static DWORD WINAPI jc_thread(LPVOID p)
      * Confirms timing-vs-never before committing to the async rewrite. */
     { const char* d = getenv("SPURS_JC_DELAY");
       if (d && *d) Sleep((unsigned)atoi(d)); }
-    jc_execute(s_jobchains[slot].entry_ea, s_jobchains[slot].jc_ea,
-               s_jobchains[slot].size_desc);
-    s_jobchains[slot].running = 0;
-    /* Tell the application the chain is done. Without this the walk finishes
-     * in silence and a thread waiting on the attached queue never runs again. */
-    jc_signal_done(s_jobchains[slot].jc_ea, -1);
+    for (;;) {
+        s_jobchains[slot].rerun = 0;
+        jc_execute(slot, s_jobchains[slot].entry_ea, s_jobchains[slot].jc_ea,
+                   s_jobchains[slot].size_desc);
+        s_jobchains[slot].running = 0;
+        /* Tell the application the chain is done. Without this the walk finishes
+         * in silence and a thread waiting on the attached queue never runs again. */
+        jc_signal_done(s_jobchains[slot].jc_ea, -1);
+        /* A Run during the walk may have written its job behind the END we just
+         * read: go round again, unless that Run already started a new walker. */
+        if (!jc_resume_mode() || !s_jobchains[slot].rerun ||
+            _InterlockedCompareExchange(&s_jobchains[slot].running, 1, 0) != 0)
+            break;
+    }
     return 0;
 }
 
@@ -2776,6 +2829,7 @@ static s32 jc_start(u64 jc_ea, const char* who)
             jc_dump_commands(who, s_jobchains[i].entry_ea, 16);
         }
         if (s_off || !s_jobchains[i].entry_ea) return CELL_OK;
+        s_jobchains[i].rerun = 1;
         /* Coalesce: a chain already being walked must not start twice. */
         if (_InterlockedCompareExchange(&s_jobchains[i].running, 1, 0) == 0) {
             HANDLE th = CreateThread(NULL, 1u << 20, jc_thread, (LPVOID)(intptr_t)i, 0, NULL);
@@ -2892,22 +2946,22 @@ s32 _cellSpursQueueInitialize(u64 spurs_ea, u64 taskset_ea, u64 queue_ea,
      * queue to reason about. */
     uint32_t q = (uint32_t)queue_ea;
     for (uint32_t o = 0; o < 128; o += 4) vm_write32(q + o, 0);
-    /* W3 at +0x0C is the ring modulus the consumer reduces indices by: the
-     * empty test is (W1-W0) mod 2*W3 and the buffer slot is index mod W3
-     * (derived at 0x12914..0x129B8). Leaving it zero degenerated both and made
-     * the queue look permanently empty no matter what a producer wrote. */
+    /* The header the SPU-side libspurs reads (SDK 4.3, s430001), taken from
+     * Deadpool's gcmxk_kernel_task, whose cellSpursQueuePop GETLLARs this line
+     * into LS 0x80 and then uses:
+     *   +0x00 pop index    +0x04 push index  (both run modulo 2*depth; ~v
+     *                                          marks an operation in flight)
+     *   +0x08 element size  -> straight into MFC_Size for the element GET
+     *   +0x0C depth          the ring modulus (slot = index mod depth)
+     *   +0x10 buffer EA, u64 -> 64-bit added to index*size for the GET
+     *   +0x1C direction      pop refuses SPU2PPU (1) with 0x80410909
+     * The previous layout had size at +0x10 and the buffer at +0x18, so the
+     * first pop ever to run (nothing had pushed before) GOT size 0 from
+     * EA 0x10_00000100 -- size:depth read back as a 64-bit address. */
+    vm_write32(q + 0x08, size);
     vm_write32(q + 0x0C, depth);
-    vm_write32(q + 0x10, size);
-    vm_write32(q + 0x14, depth);
-    vm_write64(q + 0x18, (u64)(uint32_t)buffer_ea);
-    /* NOT direction at +0x24 and NOT init at +0x2C. Both sit inside the
-     * 16-byte group at +0x20..+0x2F that the consumer owns and shifts wholesale
-     * (shlqbyi <group>,1 at 0x12A0C). The trace shows the two values we used to
-     * write there marching through it one byte per dequeue --
-     *   +0x24: 00000002 -> 00000200 -> 00020000 -> 02000000
-     *   +0x2C: 00000001 -> 00000100 -> 00010000 -> 01000000
-     * -- i.e. we were feeding garbage into the SPU's own state every cycle.
-     * Whatever holds direction/init, it is not these offsets. */
+    vm_write64(q + 0x10, (u64)(uint32_t)buffer_ea);
+    vm_write32(q + 0x1C, direction);
     vm_write64(q + 0x70, (u64)(uint32_t)taskset_ea);
     memset(vm_base + (uint32_t)buffer_ea, 0, (size_t)size * depth);
 
@@ -2915,6 +2969,54 @@ s32 _cellSpursQueueInitialize(u64 spurs_ea, u64 taskset_ea, u64 queue_ea,
     if (PS3_LOG_FIRST(_n, 8))
         printf("[cellSpurs] _QueueInitialize(taskset=0x%08X q=0x%08X buf=0x%08X size=%u depth=%u dir=%u) -> BE line written\n",
                (u32)taskset_ea, (u32)queue_ea, (u32)buffer_ea, size, depth, direction);
+    return CELL_OK;
+}
+
+/* SDK ABI: cellSpursQueuePopBody(CellSpursQueue*, void* buffer, u32 isPeek,
+ * u32 isBlocking) -- NID 0x91066667. cellSpursQueuePop/TryPop/Peek are inline
+ * wrappers passing (0,1)/(0,0)/(1,1); Deadpool's call sites (0x00C241B8 etc.)
+ * pass r5 = 0 and r6 = 1 or 0.
+ *
+ * The PPU end of an SPU-to-PPU queue, over the header cellSpursQueuePushBody
+ * uses: +0x00 pop index, +0x04 push index (both mod 2*depth, ~v while a side
+ * is mid-operation), +0x08 element size, +0x0C depth, +0x10 buffer. An SPU
+ * push in flight shows as ~old in the push index, so normalising it leaves
+ * the entry being written out of the count. Unresolved, the import returned
+ * CELL_OK with nothing copied and the caller consumed stale stack bytes. */
+s32 cellSpursQueuePopBody(u64 queue_ea, u64 buffer_ea, u32 isPeek, u32 isBlocking)
+{
+    if (!queue_ea || !buffer_ea) return CELL_SPURS_TASK_ERROR_NULL_POINTER;
+    const uint32_t q = (uint32_t)queue_ea;
+    const uint32_t sz  = vm_read32(q + 0x08);
+    const int32_t  mod = (int32_t)vm_read32(q + 0x0C);
+    const uint32_t buf = (uint32_t)vm_read64(q + 0x10);
+    if (!sz || mod <= 0 || !buf) return CELL_SPURS_TASK_ERROR_INVAL;
+
+    int32_t pop, push;
+    for (;;) {
+        int32_t w0 = (int32_t)vm_read32(q + 0x00), w1 = (int32_t)vm_read32(q + 0x04);
+        pop  = (w0 < 0) ? ~w0 : w0;
+        push = (w1 < 0) ? ~w1 : w1;
+        int32_t used = (pop > push) ? push - pop + 2 * mod : push - pop;
+        if (used > 0) break;
+        if (!isBlocking) return (s32)0x8041090Au;             /* CELL_SPURS_TASK_ERROR_BUSY */
+        Sleep(1);
+    }
+    __atomic_thread_fence(__ATOMIC_ACQUIRE);                   /* counter before the entry */
+    const uint32_t slot = (uint32_t)(pop % mod);
+    memcpy(vm_base + (uint32_t)buffer_ea, vm_base + buf + (size_t)slot * sz, sz);
+    if (!isPeek) {
+        vm_write32(q + 0x00, (uint32_t)((pop + 1) % (2 * mod)));
+        __atomic_thread_fence(__ATOMIC_SEQ_CST);
+        /* An SPU producer that found the ring full parks on the queue. */
+        extern int spu_taskset_signal_parked_obj_any(uint32_t);
+        spu_taskset_signal_parked_obj_any(q);
+    }
+    static int _n = 0;
+    if (PS3_LOG_FIRST(_n, 8))
+        printf("[cellSpurs] QueuePopBody q=0x%08X slot=%u size=%u peek=%u block=%u -> %08X %08X\n",
+               q, slot, sz, isPeek, isBlocking,
+               vm_read32((uint32_t)buffer_ea), vm_read32((uint32_t)buffer_ea + 4));
     return CELL_OK;
 }
 
@@ -2989,9 +3091,9 @@ s32 cellSpursQueuePushBody(u64 queue_ea, u64 data_ea, u32 isBlocking)
     if (!queue_ea || !data_ea) return CELL_SPURS_TASK_ERROR_NULL_POINTER;
 
     uint32_t q   = (uint32_t)queue_ea;
-    uint32_t sz  = vm_read32(q + 0x10);
-    uint32_t dep = vm_read32(q + 0x14);
-    uint32_t buf = (uint32_t)vm_read64(q + 0x18);
+    uint32_t sz  = vm_read32(q + 0x08);                /* header: see _cellSpursQueueInitialize */
+    uint32_t dep = vm_read32(q + 0x0C);
+    uint32_t buf = (uint32_t)vm_read64(q + 0x10);
     uint32_t tsp = (uint32_t)vm_read64(q + 0x70);      /* eaSignal: taskset */
     if (!sz || !dep || !buf) return CELL_SPURS_TASK_ERROR_INVAL;
 
@@ -3031,13 +3133,29 @@ s32 cellSpursQueuePushBody(u64 queue_ea, u64 data_ea, u32 isBlocking)
 
     int32_t  nsync = (sync < 0) ? ~sync : sync;             /* normalise */
     int32_t  cur   = (tail < 0) ? ~tail : tail;
+    /* Full ring: (push - pop) mod 2*depth == depth. A blocking push waits for
+     * the consumer to pop; a non-blocking one reports BUSY. */
+    for (;;) {
+        int32_t used = (nsync > cur) ? cur - nsync + 2 * mod : cur - nsync;
+        if (used < mod) break;
+        if (!isBlocking) return (s32)0x8041090Au;           /* CELL_SPURS_TASK_ERROR_BUSY */
+        Sleep(1);
+        sync  = (int32_t)vm_read32(q + 0x00);
+        nsync = (sync < 0) ? ~sync : sync;
+    }
     uint32_t slot  = (uint32_t)(cur % mod);
 
     memcpy(vm_base + buf + (size_t)slot * sz, vm_base + (uint32_t)data_ea, sz);
 
     int32_t  nxt   = (cur + 1) % (2 * mod);
     int32_t  ntail = nxt;
-    vm_write32(q + 0x04, (uint32_t)ntail);
+    /* The waiter ring is read and rewritten here while the consumer registers
+     * itself in it with GETLLAR/PUTLLC, so the whole update holds the line
+     * lock, or a wait registered in between is undone and the task sleeps for
+     * good. Raw stores inside: vm_write32 takes the same non-recursive lock. */
+    spu_lockline_lock();
+    qp[4] = (uint8_t)((uint32_t)ntail >> 24); qp[5] = (uint8_t)((uint32_t)ntail >> 16);
+    qp[6] = (uint8_t)((uint32_t)ntail >> 8);  qp[7] = (uint8_t)ntail;
 
     /* Waiter ring at +0x20: byte[0] = count, byte[1..12] = task ids. */
     uint32_t waiters = qp[0x20];
@@ -3052,6 +3170,9 @@ s32 cellSpursQueuePushBody(u64 queue_ea, u64 data_ea, u32 isBlocking)
         qp[0x22] = qp[0x23];
         qp[0x23] = 0;
         qp[0x20] = (uint8_t)(waiters - 1);
+    }
+    ef_line_end(q);
+    if (woke >= 0) {
         extern void spu_taskset_signal_task(uint32_t taskset_ea, uint32_t taskId);
         spu_taskset_signal_task(tsp, (uint32_t)woke);
     }
@@ -3060,6 +3181,12 @@ s32 cellSpursQueuePushBody(u64 queue_ea, u64 data_ea, u32 isBlocking)
         printf("[cellSpurs] QueuePush#%d q=0x%08X slot=%u (cur=%u->%u) buf=0x%08X+0x%X "
                "size=%u depth=%u waiters=%u woke=%d sync=%d/%d tail=%d->%d taskset=0x%08X\n",
                _n, q, slot, cur, nxt, buf, slot * sz, sz, dep, waiters, woke, sync, nsync, tail, ntail, tsp);
+    if (getenv("SPURS_QUEUE_TRACE")) {
+        printf("[cellSpurs]   element:");
+        for (uint32_t o = 0; o < sz && o < 64; o += 4)
+            printf(" %08X", vm_read32((uint32_t)data_ea + o));
+        printf("\n");
+    }
     return CELL_OK;
 }
 
@@ -3347,6 +3474,14 @@ s32 cellSpursQueueAttachLv2EventQueue(u64 queue_ea)
     return CELL_OK;
 }
 
+/* The other end of the above: nothing was bound, so nothing to release. A title
+ * calls it from its queue teardown on each level change. */
+s32 cellSpursQueueDetachLv2EventQueue(u64 queue_ea)
+{
+    (void)queue_ea;
+    return CELL_OK;
+}
+
 /* _cellSpursLFQueueInitialize(void* pTasksetOrSpurs, CellSpursLFQueue* pQueue,
  *      const void* buffer, u32 size, u32 depth, u32 direction)
  *
@@ -3412,6 +3547,73 @@ s32 _cellSpursLFQueueInitialize(u64 owner_ea, u64 queue_ea, u64 buffer_ea,
     if (PS3_LOG_FIRST(_n, 8))
         printf("[cellSpurs] _LFQueueInitialize(owner=0x%08X q=0x%08X buf=0x%08X size=%u depth=%u dir=%u) -> BE line written\n",
                (u32)owner_ea, (u32)queue_ea, (u32)buffer_ea, size, depth, direction);
+    return CELL_OK;
+}
+
+/* _cellSpursLFQueuePushBody(lfqueue, data, isBlocking) -- NID 0x8A85674D.
+ *
+ * The consumer is real SPU code (libspurs' LF-queue pop, e.g. Deadpool's EDGE
+ * ZLIB task and Resistance 2's Wws_Job kernel) reading the 128-byte
+ * CellSyncLFQueue line out of main memory with GETLLAR/PUTLLC, so the bytes
+ * are the interface. Canonical layout (RPCS3 cellSync.h): h1 completed-pop
+ * u16 @+0x00, h4 reserved-pop u16 @+0x06, h5 completed-push u16 @+0x08, size
+ * @+0x10, depth @+0x14, buffer u64 @+0x18. The consumer's has-work test is
+ * (h5 - h4) mod 2*depth > 0, so the completed-push counter is what advances.
+ * Deadpool's pop reads exactly h1/h5/h6 (rotqbyi 14/6/8 on the line at LS
+ * 0x80, spu_0000 0x919C..0x91A8).
+ *
+ * Ported from the Resistance 2 tree. With no handler the import was
+ * unresolved: Deadpool's package inflate requests never reached the EDGE ZLIB
+ * task, and the main thread waited on its completion flag for good. */
+s32 _cellSpursLFQueuePushBody(u64 queue_ea, u64 data_ea, u32 isBlocking)
+{
+    const uint32_t q = (uint32_t)queue_ea;
+    if (!q || !data_ea) return CELL_SPURS_CORE_ERROR_NULL_POINTER;
+
+    /* PS3_LFQ_LOG=<n>: trace the first n pushes (default 8). */
+    static int _n = 0, _cap = -1;
+    if (_cap < 0) { const char* e = getenv("PS3_LFQ_LOG"); _cap = e ? atoi(e) : 8; }
+    const int log = PS3_LOG_FIRST(_n, _cap);
+
+    const u32 size   = vm_read32(q + 0x10);
+    const u32 depth  = vm_read32(q + 0x14);
+    const u32 buffer = (u32)vm_read64(q + 0x18);
+    const u32 span   = depth * 2;
+    if (!size || !depth || size > 256 || depth > 4096) {
+        if (log) printf("[cellSpurs] _LFQueuePushBody q=0x%08X: not a canonical ring (size=%u depth=%u) -> AGAIN\n",
+                        q, size, depth);
+        return CELL_SPURS_CORE_ERROR_AGAIN;
+    }
+
+    u32 push_h5;
+    for (;;) {
+        const s32 pop_h4 = (s32)vm_read16(q + 0x06);
+        push_h5 = vm_read16(q + 0x08);
+        s32 count = (s32)push_h5 - pop_h4;
+        if (count < 0) count += (s32)span;
+        if ((u32)count < depth) break;
+        if (!isBlocking) return CELL_SPURS_CORE_ERROR_AGAIN;   /* TryPush: full */
+        Sleep(1);                                              /* Push: wait for a pop */
+    }
+
+    const u32 slot = push_h5 >= depth ? push_h5 - depth : push_h5;
+    memcpy(vm_base + buffer + slot * size, vm_base + (u32)data_ea, size);
+    __atomic_thread_fence(__ATOMIC_RELEASE);                   /* entry before the counter */
+    /* Completed-push counter, wrapped at 2*depth (RPCS3 CompletePushPointer). */
+    const u16 next_h5 = (u16)((push_h5 + 1 >= span) ? 0 : push_h5 + 1);
+    vm_write16(q + 0x08, next_h5);
+    /* Publish h5 before scanning the parked list; the consumer publishes its
+     * park before re-reading h5 (spu_lfq_wait_satisfied in the WAIT_SIGNAL
+     * handler), so one of the two always sees the other. */
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+
+    extern int spu_taskset_signal_parked_obj_any(uint32_t);
+    extern int spu_taskset_signal_parked_force(void);
+    int woke = spu_taskset_signal_parked_obj_any(q);
+    if (!woke) woke = spu_taskset_signal_parked_force();
+    if (log)
+        printf("[cellSpurs] _LFQueuePushBody q=0x%08X: %u bytes -> slot %u (h5 %u -> %u), woke %d\n",
+               q, size, slot, push_h5, next_h5, woke);
     return CELL_OK;
 }
 

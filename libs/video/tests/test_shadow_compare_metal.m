@@ -7,7 +7,7 @@ u8* vm_base;
 u32 cellGcmResolveLocated(int local,u32 off){(void)local;return off;}
 static int checks,failures;
 #define CHECK(c,n) do{checks++;if(!(c)){failures++;fprintf(stderr,"FAIL %s\n",n);}}while(0)
-static float expected(unsigned mode,float ref,float d){switch(mode){case 1:return ref<d;case 2:return ref==d;case 3:return ref<=d;case 4:return ref>d;case 5:return ref!=d;case 6:return ref>=d;default:return d;}}
+static float expected(unsigned mode,float ref,float d){switch(mode){case 1:return d<ref;case 2:return d==ref;case 3:return d<=ref;case 4:return d>ref;case 5:return d!=ref;case 6:return d>=ref;default:return d;}}
 int main(void){@autoreleasepool{
  s_dev=MTLCreateSystemDefaultDevice();if(!s_dev)return 2;s_queue=[s_dev newCommandQueue];vm_base=calloc(1,4096);
  rsx_test_fp_instr(vm_base+256,RSX_TEST_FP_OPC(0x18)|RSX_TEST_FP_MASK_XYZW|RSX_TEST_FP_INSRC_TC0|RSX_TEST_FP_END,RSX_TEST_FP_SRC_INPUT|RSX_TEST_FP_SWZ_IDENT);

@@ -98,6 +98,9 @@ typedef struct {
     rsx_be_format fmt;
     u32 handle;
     u32 feedback;          /* last immutable own-target copy, engine-owned */
+    u32 part;              /* last copy of a top-left part, engine-owned */
+    u32 part_w, part_h;    /* its size */
+    u64 part_serial;       /* color_serial it was taken at */
     u64 color_serial;       /* g.write_serial of the last colour write, or 0 */
     int guest_dirty;        /* rendered since guest memory last got a copy   */
 } eng_surface;
@@ -599,6 +602,7 @@ static u32 eng_surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
 
     eng_surface* s = &g.surfaces[slot];
     if (s->feedback) { g.be->texture_release(g.be->user, s->feedback); s->feedback = 0; }
+    if (s->part) { g.be->texture_release(g.be->user, s->part); s->part = 0; }
     if (s->handle) g.be->color_target_release(g.be->user, s->handle);
     s->location = location; s->offset = offset;
     s->w = want_w; s->h = want_h; s->fmt = want_fmt;
@@ -900,6 +904,11 @@ static u32 eng_zdepth_snapshot(u32 slot)
     if (!g.be->depth_snapshot) return 0;
     const u32 tex = g.be->depth_snapshot(g.be->user, z->handle, z->w, z->h);
     if (!tex) return 0;
+    /* A draw already queued keeps the old copy: the backend retires a released
+     * object only after the recorded commands are encoded. Left unreleased, a
+     * title sampling its depth each frame filled the backend's 4096 object slots
+     * in about a minute, and from then on no texture could be created. */
+    if (z->snapshot) g.be->texture_release(g.be->user, z->snapshot);
     z->snapshot = tex;
     z->snapshot_valid = 1;
     return tex;
@@ -2071,6 +2080,35 @@ static u32 eng_color_feedback_failure(u32 unit, const eng_surface* s,
     return ENG_INVALID;
 }
 
+/* A texture smaller than the target at its offset, on the target's pitch, is that
+ * target's top-left corner: RSX addresses it by memory. Deadpool draws half-size
+ * scene colour into the corner of its 1024x600 target and samples it as 512x300;
+ * binding the whole target put the full image in the tonemap's half-size input. */
+static int eng_texture_is_corner(const eng_surface* s, const rsx_dsp_texture* t)
+{
+    return g.be->color_snapshot_rect && t->pitch && t->pitch == s->pitch &&
+           t->width && t->height && t->width <= s->w && t->height <= s->h &&
+           (t->width < s->w || t->height < s->h);
+}
+
+/* A copy of that corner, taken again whenever the target has been written. */
+static int eng_surface_corner(eng_surface* s, const rsx_dsp_texture* t, u32* out)
+{
+    if (!s->part || s->part_w != t->width || s->part_h != t->height ||
+        s->part_serial != s->color_serial) {
+        const u32 copy = g.be->color_snapshot_rect(g.be->user, s->handle, t->width, t->height);
+        if (!copy) return 0;
+        if (s->part) g.be->texture_release(g.be->user, s->part);
+        s->part = copy; s->part_w = t->width; s->part_h = t->height;
+        s->part_serial = s->color_serial;
+    }
+    const u32 view = g.be->surface_view
+        ? g.be->surface_view(g.be->user, s->part, t->remap & 0xFFFFu, t->format)
+        : 0;
+    *out = view ? view : s->part;
+    return 1;
+}
+
 static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
                               u32 current_zslot, u32 tex_used,
                               u32 textures[RSX_BE_MAX_TEXTURES],
@@ -2128,6 +2166,10 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
                 continue;
             }
         }
+        /* The corner of a target being drawn into: a copy of that part, as below. */
+        if (own && zsrc < 0 && eng_texture_is_corner(&g.surfaces[surface_at], &t) &&
+            eng_surface_corner(&g.surfaces[surface_at], &t, &textures[u]))
+            continue;
         if (own && zsrc < 0 && g.be->color_snapshot) {
             eng_surface* s = &g.surfaces[surface_at];
             rsx_dsp_surface sf;
@@ -2164,6 +2206,9 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
                                        (t.dimension == 3 && !t.cubemap) ? t.depth : 1u);
             continue;
         }
+        if (sampled >= 0 && eng_texture_is_corner(&g.surfaces[sampled], &t) &&
+            eng_surface_corner(&g.surfaces[sampled], &t, &textures[u]))
+            continue;
         if (sampled >= 0) {
             const u32 view = g.be->surface_view
                 ? g.be->surface_view(g.be->user, g.surfaces[sampled].handle,
@@ -2919,6 +2964,7 @@ void rsx_draw_engine_shutdown(void)
         if (g.pipelines[i].handle) g.be->pipeline_release(g.be->user, g.pipelines[i].handle);
     for (u32 i = 0; i < g.n_surfaces; i++) {
         if (g.surfaces[i].feedback) g.be->texture_release(g.be->user, g.surfaces[i].feedback);
+        if (g.surfaces[i].part) g.be->texture_release(g.be->user, g.surfaces[i].part);
         if (g.surfaces[i].handle) g.be->color_target_release(g.be->user, g.surfaces[i].handle);
     }
     for (u32 i = 0; i < g.n_zdepths; i++)

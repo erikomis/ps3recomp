@@ -50,6 +50,14 @@ static uint64_t spu_host_ns(void)
     return (uint64_t)(c.QuadPart / s_freq.QuadPart) * 1000000000ull
          + (uint64_t)(c.QuadPart % s_freq.QuadPart) * 1000000000ull
            / (uint64_t)s_freq.QuadPart;
+#elif defined(__APPLE__) && defined(__aarch64__)
+    /* The counter itself: an SPU polling its decrementer reads this constantly, and
+     * clock_gettime took 5% of FMOD's mixer. */
+    static uint64_t s_freq;
+    uint64_t t;
+    __asm__ volatile("mrs %0, cntvct_el0" : "=r"(t));
+    if (!s_freq) __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(s_freq));
+    return (t / s_freq) * 1000000000ull + (t % s_freq) * 1000000000ull / s_freq;
 #else
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -293,6 +301,7 @@ typedef struct spu_mfc_slot {
 
 static spu_mfc_slot* s_mfc_slots;
 static SRWLOCK s_mfc_claim_lock = SRWLOCK_INIT;
+static mfc_engine* mfc_for_slow(spu_context* ctx);
 
 /* SPU_PCSAMPLE=<secs>: every <secs>, print image and pc of every context
  * holding an MFC slot -- i.e. every live SPU that has done DMA. Answers
@@ -317,11 +326,34 @@ static DWORD WINAPI spu_pcsample_thread(LPVOID p)
     }
 }
 
+/* Each thread's last answer, while the slot list has not lost an entry. This runs on
+ * every MFC channel access: the shared lock and the list walk took a quarter of the
+ * time of Deadpool's job queue thread. */
+static volatile uint32_t s_mfc_slots_gen;
+
 static mfc_engine* mfc_for(spu_context* ctx)
 {
-    { static volatile LONG started = 0; const char* e;
-      if (!started && (e = getenv("SPU_PCSAMPLE")) && !InterlockedExchange(&started, 1))
-          CreateThread(NULL, 0, spu_pcsample_thread, (LPVOID)(uintptr_t)(atoi(e) * 1000), 0, NULL); }
+    static SPU_THREAD_LOCAL spu_context* t_ctx;
+    static SPU_THREAD_LOCAL mfc_engine* t_mfc;
+    static SPU_THREAD_LOCAL uint32_t t_gen;
+    const uint32_t gen = __atomic_load_n(&s_mfc_slots_gen, __ATOMIC_ACQUIRE);
+    if (t_ctx == ctx && t_gen == gen) return t_mfc;
+    mfc_engine* const found = mfc_for_slow(ctx);
+    t_ctx = ctx; t_mfc = found; t_gen = gen;
+    return found;
+}
+
+static mfc_engine* mfc_for_slow(spu_context* ctx)
+{
+    { static volatile LONG started = 0;
+      /* One-shot: flip the flag regardless of the lookup result, so the hot
+       * MFC path never pays getenv (+ its env lock, contested by the other SPU
+       * threads) again. An env value read at the first call controls sampling. */
+      if (!InterlockedExchange(&started, 1)) {
+          const char* e = getenv("SPU_PCSAMPLE");
+          if (e)
+              CreateThread(NULL, 0, spu_pcsample_thread, (LPVOID)(uintptr_t)(atoi(e) * 1000), 0, NULL);
+      } }
     AcquireSRWLockShared(&s_mfc_claim_lock);
     for (spu_mfc_slot* slot = s_mfc_slots; slot; slot = slot->next) {
         if (slot->ctx == ctx) {
@@ -362,6 +394,7 @@ void spu_mfc_release(spu_context* ctx)
         if ((*link)->ctx != ctx) continue;
         spu_mfc_slot* slot = *link;
         *link = slot->next;
+        __atomic_fetch_add(&s_mfc_slots_gen, 1, __ATOMIC_RELEASE);
         free(slot);
         break;
     }
@@ -378,6 +411,7 @@ void spu_mfc_forget_range(uintptr_t lo, uintptr_t hi)
         uintptr_t owner = (uintptr_t)slot->ctx;
         if (owner >= lo && owner < hi) {
             *link = slot->next;
+            __atomic_fetch_add(&s_mfc_slots_gen, 1, __ATOMIC_RELEASE);
             free(slot);
         } else {
             link = &slot->next;
@@ -1512,8 +1546,31 @@ int spu_have_function(uint32_t addr)
  * (spu_interp.c, rejoin path). It IS the registry lookup, so overlay eviction and
  * self-modifying-code invalidation are honored automatically. Lived in
  * spu_fn_registry.c before the registry was consolidated into this TU. */
+/* The resident image whose code is at this address now, or 0: it must still hold
+ * the bytes the image was loaded from. */
+int spu_resident_owner(const spu_context* ctx, uint32_t lsa)
+{
+    for (unsigned slot = 0; slot < 4; ++slot) {
+        const uint32_t base = ctx->resident_code[slot].lsa;
+        if (!ctx->resident_code[slot].image_id || lsa < base ||
+            lsa - base >= ctx->resident_code[slot].size)
+            continue;
+        if (memcmp(ctx->ls + lsa, vm_base + ctx->resident_code[slot].source_ea + (lsa - base), 4) == 0)
+            return ctx->resident_code[slot].image_id;
+    }
+    return 0;
+}
+
 spu_lifted_fn spu_lifted_lookup(const spu_context* ctx, uint32_t lsa)
 {
+    /* Code resident at this address wins, as in spu_indirect_branch. Without this
+     * the interpreter could never hand back to a lifted overlay: Deadpool's FMOD
+     * mixer reaches its DSP plugins from interpreted code, and ran them all
+     * interpreted, too slow to mix in real time. */
+    if (ctx) {
+        const int owner = spu_resident_owner(ctx, lsa);
+        if (owner) return (spu_lifted_fn)spu_lookup(lsa, owner);
+    }
     return (spu_lifted_fn)spu_lookup(lsa, ctx ? ctx->image_id : 0);
 }
 
@@ -1630,6 +1687,16 @@ static int spu_taskset_resident_image(const spu_context* ctx)
 /* Content-signature variant: FMOD COPIES codec overlays to the heap before
  * streaming them into the swap slot, so the source EA is unknowable ahead of
  * time -- match the first 16 bytes of the streamed content instead. */
+/* A bounded code image found by its first bytes, for one loaded from a file to an
+ * address that changes between runs. Translated at its local-store address. */
+void spu_overlay_register_sig_region(const uint8_t sig[16], uint32_t span, int image_id)
+{
+    if (!span || span > SPU_LS_SIZE || s_ovl_src_count >= SPU_OVL_SRC_MAX) return;
+    extern void spu_overlay_register_sig(const uint8_t[16], int);
+    spu_overlay_register_sig(sig, image_id);
+    s_ovl_src[s_ovl_src_count - 1].span = span;
+}
+
 void spu_overlay_register_sig(const uint8_t sig[16], int image_id)
 {
     if (s_ovl_src_count < SPU_OVL_SRC_MAX) {
@@ -1699,14 +1766,6 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
 {
     uint32_t lsa = (uint32_t)(ls - ctx->ls);
     spu_ovl_dump(ctx, ea, lsa, ls, size);
-    for (unsigned slot = 0; slot < 4; ++slot) {
-        if (!ctx->resident_code[slot].image_id) continue;
-        uint32_t base = ctx->resident_code[slot].lsa;
-        uint32_t end = base + ctx->resident_code[slot].size;
-        if (lsa < end && lsa + size > base &&
-            (lsa < base || ea != ctx->resident_code[slot].source_ea + (lsa - base)))
-            ctx->resident_code[slot].image_id = 0;
-    }
     for (int i = 0; i < s_ovl_src_count; i++) {
         const spu_ovl_src* o = &s_ovl_src[i];
         int hit = o->has_sig ? (size >= 512 && memcmp(ls, o->sig, 16) == 0)
@@ -1714,16 +1773,23 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
         if (hit) {
             if (o->span) {
                 if (lsa + o->span > SPU_LS_SIZE) return;
-                for (unsigned slot = 0; slot < 4; ++slot) {
-                    if (ctx->resident_code[slot].image_id && ctx->resident_code[slot].lsa != lsa)
-                        continue;
-                    ctx->resident_code[slot].lsa = lsa;
-                    ctx->resident_code[slot].size = o->span;
-                    ctx->resident_code[slot].source_ea = ea;
-                    ctx->resident_code[slot].image_id = o->image_id;
-                    return;
-                }
-                fprintf(stderr, "[spu-ovl] no free resident code span for image %d\n", o->image_id);
+                /* The same address, else a free slot, else one this image lands on:
+                 * a slot overlapped by something else is only found stale at lookup
+                 * (spu_resident_owner), since a mixer can load data over part of a
+                 * module's span and keep running the rest. */
+                unsigned use = 4;
+                for (unsigned slot = 0; slot < 4 && use == 4; ++slot)
+                    if (ctx->resident_code[slot].image_id && ctx->resident_code[slot].lsa == lsa) use = slot;
+                for (unsigned slot = 0; slot < 4 && use == 4; ++slot)
+                    if (!ctx->resident_code[slot].image_id) use = slot;
+                for (unsigned slot = 0; slot < 4 && use == 4; ++slot)
+                    if (lsa < ctx->resident_code[slot].lsa + ctx->resident_code[slot].size &&
+                        lsa + o->span > ctx->resident_code[slot].lsa) use = slot;
+                if (use == 4) use = 0;
+                ctx->resident_code[use].lsa = lsa;
+                ctx->resident_code[use].size = o->span;
+                ctx->resident_code[use].source_ea = ea;
+                ctx->resident_code[use].image_id = o->image_id;
                 return;
             }
             if (ctx->resident_ovl != o->image_id) {
@@ -1790,6 +1856,36 @@ static void spu_ef_deliver_owed(spu_context* ctx, uint32_t wobj)
     { static int _n = 0; if (PS3_LOG_FIRST(_n, 8))
         fprintf(stderr, "[spu] delivered owed bits=0x%04X to object 0x%08X \n",
                 (unsigned)bits, wobj); }
+}
+
+/* WAIT_SIGNAL on a CellSyncLFQueue (the 128-byte line libspurs' LF queue is)
+ * that already holds entries is satisfied: the task pops the queue itself once
+ * the syscall returns. Without this, an entry pushed while the consumer was
+ * awake found nobody parked to wake, the consumer then parked on a signal that
+ * never comes, and the producer blocked on its completion flag for good.
+ * Canonical layout (RPCS3 cellSync.h): h4 reserved-pop u16 @+0x06, h5
+ * completed-push u16 @+0x08, size @+0x10, depth @+0x14. From the Resistance 2
+ * tree; SPURS_LFQ_NOWAKE=1 disables. */
+static int spu_lfq_wait_satisfied(uint32_t wobj)
+{
+    static int s_lfw = -1;
+    if (s_lfw < 0) { const char* e = getenv("SPURS_LFQ_NOWAKE"); s_lfw = e && *e ? 0 : 1; }
+    if (!s_lfw || !wobj || !vm_base) return 0;
+    const uint32_t q     = wobj;
+    const uint32_t size  = (vm_base[q + 0x10] << 24) | (vm_base[q + 0x11] << 16) |
+                           (vm_base[q + 0x12] << 8) | vm_base[q + 0x13];
+    const uint32_t depth = (vm_base[q + 0x14] << 24) | (vm_base[q + 0x15] << 16) |
+                           (vm_base[q + 0x16] << 8) | vm_base[q + 0x17];
+    if (!size || size > 256 || !depth || depth > 4096) return 0;   /* not a canonical ring */
+    const int pop_h4  = (int)((vm_base[q + 0x06] << 8) | vm_base[q + 0x07]);
+    const int push_h5 = (int)((vm_base[q + 0x08] << 8) | vm_base[q + 0x09]);
+    int count = push_h5 - pop_h4;
+    if (count < 0) count += (int)(depth * 2);
+    if (count <= 0) return 0;
+    { static int _n = 0; if (PS3_LOG_FIRST(_n, 8))
+        fprintf(stderr, "[spu] WAIT_SIGNAL: object 0x%08X has %d pending LFQueue "
+                        "entries -- resuming without parking\n", wobj, count); }
+    return 1;
 }
 
 void spu_spurs_taskset_syscall(spu_context* ctx)   /* non-static: also called by the pure interpreter (spu_interp.c) */
@@ -1910,13 +2006,25 @@ void spu_spurs_taskset_syscall(spu_context* ctx)   /* non-static: also called by
             extern void spu_taskset_parked_add(uint32_t, uint32_t, uint32_t);
             extern void spu_taskset_parked_del(uint32_t, uint32_t);
             extern int spu_taskset_consume_wake(uint32_t);
-            if (spu_taskset_consume_wake(ts)) {   /* a Set beat us to the park */
+            if (spu_taskset_consume_wake(ts) ||   /* a Set beat us to the park */
+                spu_lfq_wait_satisfied(wobj)) {   /* or the queue already has work */
                 spu_ef_deliver_owed(ctx, wobj);
                 ctx->gpr[3]._u32[0] = 0;
                 return;
             }
             yz_lockstep_block_begin(ctx);
             spu_taskset_parked_add(ts, tid, wobj);
+            /* Re-check AFTER publishing the park: a push that landed in between
+             * found nobody to wake. The pusher stores push_h5 then scans the
+             * parked list; with a full fence on both sides one sees the other. */
+            __atomic_thread_fence(__ATOMIC_SEQ_CST);
+            if (spu_lfq_wait_satisfied(wobj)) {
+                spu_taskset_parked_del(ts, tid);
+                yz_lockstep_block_end(ctx);
+                spu_ef_deliver_owed(ctx, wobj);
+                ctx->gpr[3]._u32[0] = 0;
+                return;
+            }
             spu_taskset_wait_signal(ts, tid);
             spu_taskset_parked_del(ts, tid);
             yz_lockstep_block_end(ctx);
@@ -2278,14 +2386,8 @@ void spu_indirect_branch(spu_context* ctx)
      * is 0 outside the region, so this only ever fires for genuine task code.) */
     spu_fn fn = NULL;
     int code_owner = 0;
-    for (unsigned slot = 0; slot < 4; ++slot) {
-        if (ctx->resident_code[slot].image_id && ctx->pc >= ctx->resident_code[slot].lsa &&
-            ctx->pc - ctx->resident_code[slot].lsa < ctx->resident_code[slot].size) {
-            code_owner = ctx->resident_code[slot].image_id;
-            fn = spu_lookup(ctx->pc, code_owner);
-            break;
-        }
-    }
+    code_owner = spu_resident_owner(ctx, (uint32_t)ctx->pc);
+    if (code_owner) fn = spu_lookup(ctx->pc, code_owner);
     if (!code_owner && ctx->resident_task)
         fn = spu_lookup(ctx->pc, ctx->resident_task);
     /* Resident overlay next: streamed code overwrote that LS range, so its lift
@@ -2397,6 +2499,12 @@ void spu_indirect_branch(spu_context* ctx)
                   fprintf(stderr, "[spu] img=%d interpreting unlifted LS 0x%05X "
                           "(runtime-loaded code)\n", ctx->image_id, p);
               spu_interp_run(ctx, p);
+              /* It stopped because it reached lifted code: that is a transfer,
+               * not a host return, and a top-level driver would end the run on
+               * an empty trampoline (see the same case in the SMC path). */
+              if (ctx->image_id >= 0 && (ctx->status & SPU_STATUS_RUNNING) &&
+                  spu_lifted_lookup(ctx, ctx->pc))
+                  g_spu_trampoline_fn = spu_indirect_branch;
               return;
           } }
         spu_halt(ctx);
