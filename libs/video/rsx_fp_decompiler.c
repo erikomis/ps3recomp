@@ -522,11 +522,15 @@ static void fp_shadow_helper(Out* p, u32 unit, u32 cube_mask,
     const char* cmp[] = { "0.0", "depth < reference", "depth == reference",
         "depth <= reference", "depth > reference", "depth != reference",
         "depth >= reference", "1.0" };
+    /* RSX_FP_SHADOW_ONE=1 (diagnostic): every depth comparison passes, i.e.
+     * nothing is in shadow -- to tell a wrong shadow map from wrong shading. */
+    static int s_shadow_one = -1;
+    if (s_shadow_one < 0) { const char* e = getenv("RSX_FP_SHADOW_ONE"); s_shadow_one = (e && *e == '1') ? 1 : 0; }
     snprintf(text, sizeof text,
         "float _rsx_shadow_cmp%u(float reference, float depth) { return (float)(%s); }\n"
         "float4 _rsx_shadow%u(float3 coordinate) {\n"
         "    float reference = saturate(coordinate.z);\n",
-        unit, cmp[d->func], unit);
+        unit, s_shadow_one ? "1.0" : cmp[d->func], unit);
     out_puts(p, text);
     if (d->linear || d->unnormalized) {
         snprintf(text, sizeof text, "    uint width, height; %s.GetDimensions(width, height);\n"

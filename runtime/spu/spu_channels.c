@@ -2323,6 +2323,46 @@ static void spu_ef_deliver_owed(spu_context* ctx, uint32_t wobj)
                 (unsigned)bits, wobj); }
 }
 
+/* WAIT_SIGNAL on a CellSyncLFQueue (the 128-byte line libspurs' LF queue is)
+ * that already holds entries is satisfied: the task pops the queue itself once
+ * the syscall returns. Without this, an entry pushed while the consumer was
+ * awake found nobody parked to wake, the consumer then parked on a signal that
+ * never comes, and the producer blocked on its completion flag for good.
+ * Canonical layout (RPCS3 cellSync.h): h4 reserved-pop u16 @+0x06, h5
+ * completed-push u16 @+0x08, size @+0x10, depth @+0x14. From the Resistance 2
+ * tree; SPURS_LFQ_NOWAKE=1 disables. */
+/* Pushes to any LFQueue from the PPU side; see the WAIT_SIGNAL handler. */
+#ifndef SPU_THREAD_LOCAL
+#  if defined(_MSC_VER)
+#    define SPU_THREAD_LOCAL __declspec(thread)
+#  else
+#    define SPU_THREAD_LOCAL __thread
+#  endif
+#endif
+volatile uint32_t g_spu_lfq_push_gen;
+
+static int spu_lfq_wait_satisfied(uint32_t wobj)
+{
+    static int s_lfw = -1;
+    if (s_lfw < 0) { const char* e = getenv("SPURS_LFQ_NOWAKE"); s_lfw = e && *e ? 0 : 1; }
+    if (!s_lfw || !wobj || !vm_base) return 0;
+    const uint32_t q     = wobj;
+    const uint32_t size  = (vm_base[q + 0x10] << 24) | (vm_base[q + 0x11] << 16) |
+                           (vm_base[q + 0x12] << 8) | vm_base[q + 0x13];
+    const uint32_t depth = (vm_base[q + 0x14] << 24) | (vm_base[q + 0x15] << 16) |
+                           (vm_base[q + 0x16] << 8) | vm_base[q + 0x17];
+    if (!size || size > 256 || !depth || depth > 4096) return 0;   /* not a canonical ring */
+    const int pop_h4  = (int)((vm_base[q + 0x06] << 8) | vm_base[q + 0x07]);
+    const int push_h5 = (int)((vm_base[q + 0x08] << 8) | vm_base[q + 0x09]);
+    int count = push_h5 - pop_h4;
+    if (count < 0) count += (int)(depth * 2);
+    if (count <= 0) return 0;
+    { static int _n = 0; if (PS3_LOG_FIRST(_n, 8))
+        fprintf(stderr, "[spu] WAIT_SIGNAL: object 0x%08X has %d pending LFQueue "
+                        "entries -- resuming without parking\n", wobj, count); }
+    return 1;
+}
+
 void spu_spurs_taskset_syscall(spu_context* ctx)   /* non-static: also called by the pure interpreter (spu_interp.c) */
 {
     uint32_t raw = ctx->gpr[3]._u32[0];
@@ -2441,16 +2481,43 @@ void spu_spurs_taskset_syscall(spu_context* ctx)   /* non-static: also called by
             extern void spu_taskset_parked_add(uint32_t, uint32_t, uint32_t);
             extern void spu_taskset_parked_del(uint32_t, uint32_t);
             extern int spu_taskset_consume_wake(uint32_t);
-            if (spu_taskset_consume_wake(ts)) {   /* a Set beat us to the park */
+            /* The object a task names need not be the queue it reads: Deadpool's zlib
+             * task parks on another object and consumes a queue of its own. A push
+             * after the task looked at that queue and before the park found nobody to
+             * wake, and the check of `wobj` saw nothing: the task slept with work
+             * queued and the thread waiting for its result never moved again. So any
+             * push since this thread last left the wait sends it back to look. */
+            static SPU_THREAD_LOCAL uint32_t t_lfq_gen;
+            extern volatile uint32_t g_spu_lfq_push_gen;
+            uint32_t lfq_gen = __atomic_load_n(&g_spu_lfq_push_gen, __ATOMIC_SEQ_CST);
+            if (spu_taskset_consume_wake(ts) ||   /* a Set beat us to the park */
+                spu_lfq_wait_satisfied(wobj) ||   /* or the queue already has work */
+                lfq_gen != t_lfq_gen) {
+                t_lfq_gen = lfq_gen;
                 spu_ef_deliver_owed(ctx, wobj);
                 ctx->gpr[3]._u32[0] = 0;
                 return;
             }
             yz_lockstep_block_begin(ctx);
             spu_taskset_parked_add(ts, tid, wobj);
+            /* Re-check AFTER publishing the park: a push that landed in between
+             * found nobody to wake. The pusher stores push_h5 then scans the
+             * parked list; with a full fence on both sides one sees the other. */
+            __atomic_thread_fence(__ATOMIC_SEQ_CST);
+            lfq_gen = __atomic_load_n(&g_spu_lfq_push_gen, __ATOMIC_SEQ_CST);
+            if (spu_lfq_wait_satisfied(wobj) || lfq_gen != t_lfq_gen) {
+                t_lfq_gen = lfq_gen;
+                spu_taskset_parked_del(ts, tid);
+                yz_lockstep_block_end(ctx);
+                spu_ef_deliver_owed(ctx, wobj);
+                ctx->gpr[3]._u32[0] = 0;
+                return;
+            }
             spu_taskset_wait_signal(ts, tid);
             spu_taskset_parked_del(ts, tid);
             yz_lockstep_block_end(ctx);
+            /* Before the guest looks at its queue again, so a later push counts. */
+            t_lfq_gen = __atomic_load_n(&g_spu_lfq_push_gen, __ATOMIC_SEQ_CST);
             spu_ef_deliver_owed(ctx, wobj);
         }
         ctx->gpr[3]._u32[0] = 0;

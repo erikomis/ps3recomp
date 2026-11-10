@@ -4549,6 +4549,15 @@ static void eng_encode_and_commit(id<MTLTexture> present_dst)
                     ps3_ft_span(PS3_FT_GPU_EXEC, s_ft_passes, s_ft_resolves | (s_ft_copies << 16),
                                 present_dst ? 1u : 0u, w1 - (uint64_t)(gpu_s * 1e9), w1);
             }
+            /* RSX_GPU_SLOW_MS=<ms>: name command buffers whose GPU execution
+             * takes longer than that, with how many records they carried. */
+            { static double lim = -1;
+              if (lim < 0) { const char* e = getenv("RSX_GPU_SLOW_MS"); lim = e ? atof(e) / 1000.0 : 0; }
+              if (lim > 0) { const double g = [cb GPUEndTime] - [cb GPUStartTime];
+                  static int n;
+                  if (g > lim && PS3_LOG_FIRST(n, 200))
+                      fprintf(stderr, "[rsx gpu-slow] %.0f ms GPU, %u records, present=%d\n",
+                              g * 1000.0, ft_nrec, present_dst ? 1 : 0); } }
             s_eng_checked_completed = [cb status] == MTLCommandBufferStatusCompleted &&
                                       ![cb error] && !s_eng_dropped && !s_eng_encoding_failed;
             if (!s_eng_checked_completed) s_eng_encoding_failed = 1;

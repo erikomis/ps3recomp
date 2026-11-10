@@ -17,6 +17,7 @@
 #include "rsx_restart_cuts.h"
 #include "rsx_tiling.h"
 #include "rsx_vertex_formats.h"
+#include "rsx_vertex_compact.h"
 #include "rsx_vp_decompiler.h"
 
 #include <stdio.h>
@@ -2173,6 +2174,7 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
      * identity only for a program that tests them. */
     const int vp_branch_bits_used = !fixed && rsx_vp_uses_branch_bits(vp_uc, vp_instrs * 16u);
     const u32 vp_branch_bits = vp_branch_bits_used ? rsx_dsp_reg(&g.rsx, 0x1FF8u) : 0;
+    const u32 vp_start = fixed ? 0 : rsx_dsp_vp_start(&g.rsx);
     const u32 ucp = fixed ? 0 : eng_user_clip_key();
     const u32 dbz = fixed ? 0 : s_dbz.unit;   /* eng_depth_bounds_prepare: unit + 1 */
 
@@ -2238,6 +2240,9 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
         key = eng_fnv1a(&fixed_tag, sizeof fixed_tag, key);
     } else {
         key = eng_vp_hash(vp_uc, vp_instrs * 16u, key);
+        /* Absolute branch targets are lowered relative to this start slot.
+         * Identical bytes at another start can generate different HLSL. */
+        key = eng_fnv1a(&vp_start, sizeof vp_start, key);
         if (vp_branch_bits_used) key = eng_fnv1a(&vp_branch_bits, sizeof vp_branch_bits, key);
         key = rsx_fp_structural_hash(fp_uc, fp_size, key);
         if (!key) return 0;
@@ -2288,6 +2293,14 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
         snprintf(s_ps_hlsl, sizeof s_ps_hlsl, "%s", kEngFixedPS);
     } else {
         rsx_vp_set_branch_bits(vp_branch_bits);
+        /* Branch targets in the microcode are absolute VP slots; the program
+         * is decompiled from its start slot, so the decompiler needs that base
+         * (live draw sets it too). Without it every target past the start was
+         * a block that does not exist: the state machine never reached the
+         * output block and ran its full 16384-iteration bound PER VERTEX --
+         * Afro Samurai's in-game shaders took 0.4-3 s of GPU per frame and
+         * wrote no position. */
+        rsx_vp_set_branch_base(vp_start);
         vi = rsx_vp_decompile_compact_ex(vp_uc, vp_instrs * 16u, vtex_mask,
                                          layout->mask, s_vs_hlsl,
                                          sizeof s_vs_hlsl);
@@ -3140,6 +3153,33 @@ static void pd_note(const u32* targets, u32 n_targets, u32 zslot,
             rsx_dsp_get_texture(&g.rsx, u, &t);
             fprintf(s_pd.draws_log, " t%u %u:0x%08X f%02X %ux%u", u, t.location, t.offset,
                     t.format & 0xFFu, t.width, t.height);
+        }
+        /* vertex streams: type/size/stride/location:offset and the first
+         * three elements of attribute 0 (position), decoded. */
+        { const u32 bo = rsx_dsp_vertex_data_base_offset(&g.rsx);
+          const u32 bi = rsx_dsp_vertex_data_base_index(&g.rsx);
+          fprintf(s_pd.draws_log, " | vb base %X/%u", bo, bi);
+          for (u32 a = 0; a < 16; a++) {
+              rsx_dsp_vertex_attr va; rsx_dsp_get_vertex_attr(&g.rsx, a, &va);
+              const u32 rawf = rsx_dsp_reg(&g.rsx, 0x1740u + a * 4u);
+              if (!va.type || !va.size) { if (rawf != 0x2u && rawf) fprintf(s_pd.draws_log, " a%u[raw %08X]", a, rawf); continue; }
+              fprintf(s_pd.draws_log, " a%u t%u s%u st%u %u:%X [%08X]", a, va.type, va.size,
+                      va.stride, va.location, va.offset, rawf);
+              if (a == 0 || a == 8) {
+                  const u32 off = rsx_dsp_resolve_vertex_offset(bo, va.offset);
+                  const u8* src = eng_guest_ptr(NULL, va.location, off, va.stride * 3u + 16u);
+                  if (src && a == 0) { fprintf(s_pd.draws_log, " raw");
+                      for (u32 w = 0; w < 16; w++) fprintf(s_pd.draws_log, " %02X%02X%02X%02X",
+                          src[w*4], src[w*4+1], src[w*4+2], src[w*4+3]); }
+                  for (u32 e = 0; src && e < 3; e++) {
+                      float f[4];
+                      if (rsx_vertex_decode_element(va.type, va.size, src + e * va.stride, f))
+                          fprintf(s_pd.draws_log, " (%g %g %g %g)", f[0], f[1], f[2], f[3]);
+                  }
+              }
+          }
+          rsx_dsp_index_array ia; rsx_dsp_get_index_array(&g.rsx, &ia);
+          fprintf(s_pd.draws_log, " | ib %u:%X u32=%u", ia.location, ia.offset, ia.is_u32);
         }
         fprintf(s_pd.draws_log, "\n");
     }

@@ -30,6 +30,8 @@ extern "C" {
 #endif
 
 extern uint8_t* vm_base;
+/* Read-only PT_LOAD of the main ELF (ppu_loader.cpp); 0/0 before load. */
+extern uint32_t g_ps3_ro_image_lo, g_ps3_ro_image_hi;
 
 /* Guard against a guest DMA whose effective address lands in reserved-but-
  * uncommitted guest memory (the 4 GB VM is MEM_RESERVE; only main mem / RSX /
@@ -265,7 +267,10 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
           int malformed = (size == 0) || (size > 0x4000)
                        || (size >= 16 && (size & 15))
                        || (((lsa ^ (uint32_t)ea) & 15) != 0)
-                       || (mfc_is_put(cmd) && (uint32_t)ea < 0x10000u);
+                       || (mfc_is_put(cmd) && (uint32_t)ea < 0x10000u)
+                       || (mfc_is_put(cmd) && g_ps3_ro_image_hi &&
+                           (uint32_t)ea < g_ps3_ro_image_hi &&
+                           (uint32_t)ea + size > g_ps3_ro_image_lo);
           if (malformed) {
               static int _n = 0;
               if (PS3_LOG_FIRST(_n, 8))

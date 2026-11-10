@@ -193,7 +193,19 @@ static uint32_t s_isr_qid = 0;
 static void rsx_send_event(uint64_t flags)
 {
     if (!s_isr_qid) return;
-    uint32_t mask = vm_read32(RSX_DRIVER_INFO_EA + RSX_DI_HANDLERS);
+    /* The handler mask the game's libgcm published. cellGcmSys's Set*Handler
+     * calls keep g_gcm_handler_mask (and, when g_gcm_driver_info_ea names the
+     * game's own driver_info block, its +0x12C0) up to date. Nothing today
+     * ever sets g_gcm_driver_info_ea, so the driver_info copy the older code
+     * read here stayed zero for every title whose game-side libgcm registers
+     * handlers by OPD through the cellGcmSet*Handler exports (Asura's Wrath
+     * registers vblank/flip/user/graphics this way): every user command was
+     * masked off and dropped, and the game waited forever for the handler
+     * that never ran. Prefer the exported mask; fall back to the HLE copy. */
+    extern uint32_t g_gcm_handler_mask;
+    uint32_t mask = g_gcm_handler_mask;
+    if (!mask)
+        mask = vm_read32(RSX_DRIVER_INFO_EA + RSX_DI_HANDLERS);
     flags &= (uint64_t)mask;
     if (!flags) return;
     sys_event_queue_push_by_id(s_isr_qid, 0, 0, flags, 0);
@@ -218,7 +230,10 @@ void rsx_raise_user_cmd(uint32_t arg)
        * "did the last user command arrive before the freeze" is the join
        * between the two halves of the deadlock. */
       if (n++ < 4 || (n % 256) == 0) {
-          uint32_t mask = vm_read32(RSX_DRIVER_INFO_EA + RSX_DI_HANDLERS);
+          extern uint32_t g_gcm_handler_mask;
+          uint32_t mask = g_gcm_handler_mask;
+          if (!mask)
+              mask = vm_read32(RSX_DRIVER_INFO_EA + RSX_DI_HANDLERS);
           fprintf(stderr, "[usercmd] #%lu arg=0x%08X handlers=0x%X qid=%u\n",
                   n, arg, mask, s_isr_qid); fflush(stderr); } }
     vm_write32(RSX_DRIVER_INFO_EA + RSX_DI_USER_CMD_PARAM, arg);
@@ -236,6 +251,18 @@ static void rsx_isr_queue_bringup(void)
     vm_write32(RSX_DRIVER_INFO_EA + RSX_DI_HANDLER_QUEUE, s_isr_qid);
     fprintf(stderr, "[sys_rsx] gcm ISR queue id=%u published at driver_info+0x12D0\n",
             s_isr_qid);
+}
+
+/* Public wrapper: bring the gcm ISR event queue up from whichever path the
+ * title actually took. A game-side libgcm that initializes through
+ * _cellGcmInitBody never calls sys_rsx_memory_allocate (the syscall), so the
+ * bringup that lives there was skipped and every rsx_send_event -- user
+ * commands above all -- was dropped on qid 0. Asura's Wrath is such a title:
+ * it registers vblank/flip/user handlers, then waits on the user-command
+ * path. Idempotent: a later sys_rsx_memory_allocate finds the queue made. */
+void rsx_isr_ensure_queue(void)
+{
+    rsx_isr_queue_bringup();
 }
 
 /* ---------------------------------------------------------------------------

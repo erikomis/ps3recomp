@@ -268,6 +268,15 @@ static int http_parse_response_headers(HttpTransSlot* t, const char* hdr_end)
  * API implementations
  * -----------------------------------------------------------------------*/
 
+/* InitCookie: sets up the cookie store the HTTP client uses. Asura's Wrath
+ * (BLUS30721) imports it (NID 0x9638F766) around its PSN/store paths; a
+ * no-op store keeps the boot going -- no network features are claimed. */
+s32 cellHttpInitCookie(void)
+{
+    printf("[cellHttp] InitCookie()\n");
+    return CELL_OK;
+}
+
 s32 cellHttpInit(void* pool, u32 poolSize)
 {
     printf("[cellHttp] Init(pool=%p, poolSize=%u)\n", pool, poolSize);

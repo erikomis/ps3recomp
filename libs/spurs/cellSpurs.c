@@ -2890,11 +2890,30 @@ s32 cellSpursJobGuardReset(u64 guard_ea)
  * chain then gives up this pass rather than spinning the walker thread
  * forever). An unknown guard opens immediately -- a chain guarded by something
  * we never saw initialised must not deadlock the walker. */
-static int jg_wait(u32 ea)
+/* SPURS_JG_WAIT_FOREVER=1: a closed guard holds the walker until it opens, as
+ * on hardware, for as long as the chain runs (Shutdown clears `running`, which
+ * still ends the wait). The 20 s give-up ended Afro Samurai's skinning chain at
+ * boot -- its guard first opens when a game starts, minutes later -- so New
+ * Game notified a chain nobody walked, no job-done event came, and the render
+ * thread waited on its event queue for good. Off by default: titles were
+ * tuned against the give-up. */
+static int jg_wait_forever(void)
+{
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("SPURS_JG_WAIT_FOREVER"); on = (e && e[0] == '1') ? 1 : 0; }
+    return on;
+}
+
+static int jg_wait(u32 ea, u32 jc_ea)
 {
     int i = jg_find(ea);
     if (i < 0) return 1;
-    for (int spin = 0; spin < 20000; spin++) {     /* ~20 s at 1 ms */
+    const int forever = jg_wait_forever();
+    int slot = -1;
+    for (int c = 0; c < MAX_JOBCHAINS; c++)
+        if (s_jobchains[c].jc_ea == jc_ea) { slot = c; break; }
+    for (int spin = 0; forever || spin < 20000; spin++) {     /* ~20 s at 1 ms */
+        if (forever && (slot < 0 || !s_jobchains[slot].running)) return 0;   /* shut down */
         if (s_jobguards[i].pending >= s_jobguards[i].reset) {
             /* Consume exactly one release worth of credits, so notifies that
              * arrived during the previous lap still count. */
@@ -2947,6 +2966,23 @@ static u64 spurs_event_data3_probe(void)
 
 static void jc_signal_done(u32 jc_ea, int job_index)
 {
+    /* SPURS_JC_EVENT_FROM_JOB=1: deliver only the events the jobs themselves
+     * send. On hardware a chain posts nothing of its own; a job that wants the
+     * PPU to know writes its event through SPU_WrOutIntrMbox (bit 0x40000000 =
+     * send-event, port in the top byte), as sys_spu_thread_send_event does.
+     * Afro Samurai's skinning ring ends each lap with a 112-byte job doing just
+     * that, and its render thread waits for exactly one event per lap on a
+     * queue of depth 1. A synthetic event per job filled that queue, the real
+     * one was dropped (rc=-1), and render waited for it while the chain waited
+     * on its guard for the render thread: a frozen game after New Game. */
+    { static int s_from_job = -1;
+      if (s_from_job < 0) { const char* e = getenv("SPURS_JC_EVENT_FROM_JOB"); s_from_job = (e && e[0] == '1') ? 1 : 0; }
+      if (s_from_job) {
+          if (job_index < 0 || !g_spurs_job_mbox_valid || !(g_spurs_job_mbox_intr & 0x40000000u)) {
+              if (job_index >= 0) g_spurs_job_mbox_valid = 0;   /* consumed: nothing to send */
+              return;
+          }
+      } }
     /* Carry the job's mailbox answer in the completion event. On hardware the
      * SPU's outbound/interrupt mailbox is what the SPURS event delivers; a
      * synthetic payload means the caller reads back zero for whatever it
@@ -3013,7 +3049,23 @@ static void jc_execute(u32 entry_ea, u32 jc_ea, u32 size_desc)
      * count that instead and reset it whenever real work happens. */
     int idle = 0;
     for (;; idle++) {
-        if (idle > 4096) break;
+        if (idle > 4096) {
+            /* SPURS_JG_WAIT_FOREVER: a chain spinning between jobs is waiting
+             * for the PPU to write its next work (Afro Samurai's skinning chain
+             * after a frame's jobs), as the SPU keeps polling on hardware. Keep
+             * walking, a little slower, for as long as the chain runs. */
+            if (!jg_wait_forever()) break;
+            int slot = -1;
+            for (int c = 0; c < MAX_JOBCHAINS; c++)
+                if (s_jobchains[c].jc_ea == jc_ea) { slot = c; break; }
+            if (slot < 0 || !s_jobchains[slot].running) return;
+#ifdef _WIN32
+            Sleep(1);
+#else
+            usleep(200);
+#endif
+            idle = 0;
+        }
         u64 cmd = vm_read64(pc);
         u32 op  = (u32)(cmd & 7);
         u32 ext = (u32)(cmd & 127);
@@ -3036,8 +3088,27 @@ static void jc_execute(u32 entry_ea, u32 jc_ea, u32 size_desc)
         if (op == 4) { ret_pc = pc + 8; pc = (u32)(cmd & ~7ull); continue; }  /* CALL */
         if (op == 7) {
             if (ext == (7 | (15 << 3))) {                     /* END */
-                printf("[cellSpurs] chain 0x%08X: END after %d job(s)\n", jc_ea, jobs);
+                { static int _n = 0; if (PS3_LOG_FIRST(_n, 8))
+                    printf("[cellSpurs] chain 0x%08X: END after %d job(s)\n", jc_ea, jobs); }
                 if (jobs) jc_signal_done(jc_ea, jobs - 1);
+                /* SPURS_JG_WAIT_FOREVER: a ring chain kicked once (Afro
+                 * Samurai's skinning chain) only shows END while the PPU is
+                 * appending the next frame's work over it; the walker leaving
+                 * there left the chain with no walker for good. Wait for the
+                 * word to change and go on from it, while the chain runs. */
+                if (jg_wait_forever()) {
+                    int slot = -1;
+                    for (int c = 0; c < MAX_JOBCHAINS; c++)
+                        if (s_jobchains[c].jc_ea == jc_ea) { slot = c; break; }
+                    while (slot >= 0 && s_jobchains[slot].running && vm_read64(pc) == cmd) {
+#ifdef _WIN32
+                        Sleep(1);
+#else
+                        usleep(200);
+#endif
+                    }
+                    if (slot >= 0 && s_jobchains[slot].running) { jobs = 0; idle = 0; continue; }
+                }
                 return;
             }
             if (ext == (7 | (14 << 3))) {                     /* RET */
@@ -3051,11 +3122,42 @@ static void jc_execute(u32 entry_ea, u32 jc_ea, u32 size_desc)
         }
         if (op == 7 && ext == (7 | (1 << 3))) {           /* GUARD */
             u32 g_ea = (u32)(cmd & ~127ull);
-            if (!jg_wait(g_ea)) return;                  /* still closed */
+            if (!jg_wait(g_ea, jc_ea)) return;           /* still closed */
+            pc += 8; continue;
+        }
+        /* JOBLIST(6): the command points at a CellSpursJobList
+         * { be u32 numJobs; be u32 sizeOfJob; be u64 eaJobList } and the
+         * chain runs those jobs in order, as if they were JOB commands. This
+         * used to be skipped as a no-op. Afro Samurai builds every frame's lap
+         * of its skinning chain as [JOB palette] -> [JOBLIST of the vertex
+         * skinning jobs] -> [JOB lap notify] -> END; with the list skipped, the
+         * skinned vertices (in-out DMA straight into the RSX-visible ring) were
+         * never written and the stride-24 draws read whatever the ring held
+         * before: the exploded geometry in play. SPURS_JC_JOBLIST=0 skips the
+         * list again (for comparison). */
+        if (op == 6) {
+            static int s_jl = -1;
+            if (s_jl < 0) { const char* e = getenv("SPURS_JC_JOBLIST"); s_jl = (e && e[0] == '0') ? 0 : 1; }
+            const u32 l   = (u32)(cmd & ~7ull);
+            const u32 n   = vm_read32(l);
+            const u32 sz  = vm_read32(l + 4);
+            const u32 ea  = (u32)vm_read64(l + 8);
+            { static int _n = 0; if (PS3_LOG_FIRST(_n, 12))
+                fprintf(stderr, "[cellSpurs] chain 0x%08X: JOBLIST @0x%08X numJobs=%u sizeOfJob=%u "
+                                "eaJobList=0x%08X%s\n", jc_ea, l, n, sz, ea, s_jl ? "" : " (skipped)"); }
+            if (s_jl && ea && sz >= 64 && n <= 4096) {
+                for (u32 i = 0; i < n; i++) {
+                    { extern u32 g_spurs_job_ls_handle; g_spurs_job_ls_handle = jc_ea; }
+                    int idx = jobs++;
+                    jc_run_one_job(ea + i * sz, idx, sz);
+                    jc_signal_done(jc_ea, idx);
+                }
+                idle = 0;
+            }
             pc += 8; continue;
         }
         /* NOP(0) / SYNC+LWSYNC(2, one virtual SPU: nothing to wait for) /
-         * FLUSH(5) / JOBLIST(6, nested arrays TODO) / SET_LABEL */
+         * FLUSH(5) / SET_LABEL */
         pc += 8;
     }
     printf("[cellSpurs] chain 0x%08X: 4096 commands with no job run after %d "
@@ -3763,6 +3865,76 @@ s32 _cellSpursLFQueueInitialize(u64 owner_ea, u64 queue_ea, u64 buffer_ea,
     if (PS3_LOG_FIRST(_n, 8))
         printf("[cellSpurs] _LFQueueInitialize(owner=0x%08X q=0x%08X buf=0x%08X size=%u depth=%u dir=%u) -> BE line written\n",
                (u32)owner_ea, (u32)queue_ea, (u32)buffer_ea, size, depth, direction);
+    return CELL_OK;
+}
+
+/* _cellSpursLFQueuePushBody(lfqueue, data, isBlocking) -- NID 0x8A85674D.
+ *
+ * The consumer is real SPU code (libspurs' LF-queue pop, e.g. Deadpool's EDGE
+ * ZLIB task and Resistance 2's Wws_Job kernel) reading the 128-byte
+ * CellSyncLFQueue line out of main memory with GETLLAR/PUTLLC, so the bytes
+ * are the interface. Canonical layout (RPCS3 cellSync.h): h1 completed-pop
+ * u16 @+0x00, h4 reserved-pop u16 @+0x06, h5 completed-push u16 @+0x08, size
+ * @+0x10, depth @+0x14, buffer u64 @+0x18. The consumer's has-work test is
+ * (h5 - h4) mod 2*depth > 0, so the completed-push counter is what advances.
+ * Deadpool's pop reads exactly h1/h5/h6 (rotqbyi 14/6/8 on the line at LS
+ * 0x80, spu_0000 0x919C..0x91A8).
+ *
+ * Ported from the Resistance 2 tree. With no handler the import was
+ * unresolved: Deadpool's package inflate requests never reached the EDGE ZLIB
+ * task, and the main thread waited on its completion flag for good. */
+s32 _cellSpursLFQueuePushBody(u64 queue_ea, u64 data_ea, u32 isBlocking)
+{
+    const uint32_t q = (uint32_t)queue_ea;
+    if (!q || !data_ea) return CELL_SPURS_CORE_ERROR_NULL_POINTER;
+
+    /* PS3_LFQ_LOG=<n>: trace the first n pushes (default 8). */
+    static int _n = 0, _cap = -1;
+    if (_cap < 0) { const char* e = getenv("PS3_LFQ_LOG"); _cap = e ? atoi(e) : 8; }
+    const int log = PS3_LOG_FIRST(_n, _cap);
+
+    const u32 size   = vm_read32(q + 0x10);
+    const u32 depth  = vm_read32(q + 0x14);
+    const u32 buffer = (u32)vm_read64(q + 0x18);
+    const u32 span   = depth * 2;
+    if (!size || !depth || size > 256 || depth > 4096) {
+        if (log) printf("[cellSpurs] _LFQueuePushBody q=0x%08X: not a canonical ring (size=%u depth=%u) -> AGAIN\n",
+                        q, size, depth);
+        return CELL_SPURS_CORE_ERROR_AGAIN;
+    }
+
+    u32 push_h5;
+    for (;;) {
+        const s32 pop_h4 = (s32)vm_read16(q + 0x06);
+        push_h5 = vm_read16(q + 0x08);
+        s32 count = (s32)push_h5 - pop_h4;
+        if (count < 0) count += (s32)span;
+        if ((u32)count < depth) break;
+        if (!isBlocking) return CELL_SPURS_CORE_ERROR_AGAIN;   /* TryPush: full */
+        Sleep(1);                                              /* Push: wait for a pop */
+    }
+
+    const u32 slot = push_h5 >= depth ? push_h5 - depth : push_h5;
+    memcpy(vm_base + buffer + slot * size, vm_base + (u32)data_ea, size);
+    __atomic_thread_fence(__ATOMIC_RELEASE);                   /* entry before the counter */
+    /* Completed-push counter, wrapped at 2*depth (RPCS3 CompletePushPointer). */
+    const u16 next_h5 = (u16)((push_h5 + 1 >= span) ? 0 : push_h5 + 1);
+    vm_write16(q + 0x08, next_h5);
+    /* Publish h5 before scanning the parked list; the consumer publishes its
+     * park before re-reading h5 (spu_lfq_wait_satisfied in the WAIT_SIGNAL
+     * handler), so one of the two always sees the other. */
+    { extern volatile uint32_t g_spu_lfq_push_gen;
+      __atomic_add_fetch(&g_spu_lfq_push_gen, 1, __ATOMIC_SEQ_CST); }
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+
+    /* Every parked task, not only those naming this queue: the wait object is not
+     * always the queue read, and a task that named none would otherwise take the
+     * wake from the real consumer. A wake with nothing to do just parks again. */
+    extern int spu_taskset_signal_parked_force(void);
+    int woke = spu_taskset_signal_parked_force();
+    if (log)
+        printf("[cellSpurs] _LFQueuePushBody q=0x%08X: %u bytes -> slot %u (h5 %u -> %u), woke %d\n",
+               q, size, slot, push_h5, next_h5, woke);
     return CELL_OK;
 }
 

@@ -1302,6 +1302,21 @@ int spu_taskset_consume_wake(uint32_t taskset_ea)
 }
 
 /* Signal every task of `taskset_ea` currently parked. Returns how many. */
+/* Signal EVERY task parked in WAIT_SIGNAL. The push handler's fallback: an
+ * unread entry sitting in the queue while its only consumer sleeps is the
+ * worse state to be left in. */
+int spu_taskset_signal_parked_force(void)
+{
+    int n = 0;
+    for (int i = 0; i < SPU_PARKED_MAX; i++) {
+        uint64_t k = s_parked[i];
+        if (!k) continue;
+        spu_taskset_signal_task((uint32_t)(k >> 32), (uint32_t)(k & 0xFFFFFFFFu) - 1u);
+        n++;
+    }
+    return n;
+}
+
 /* Wake only the task parked on `wait_obj` (0 = any task of the taskset).
  * The guest names its wait object in the WAIT_SIGNAL argument, and for YDKJ`s
  * CRI tasks the flag the PPU sets is exactly wait_obj + 0x80 -- so a Set can
