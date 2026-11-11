@@ -616,7 +616,7 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
     /* cri task (img22) atomic on the taskset: dump the loaded bitset line so we can
      * see if the task reads MY taskset (0x4005E000) with my READY bit, or elsewhere. */
     { static int s_ct=-1; if(s_ct<0) s_ct=getenv("SPU_ATOMTRACE")?1:0;
-      if(s_ct && ctx->image_id==22 && cmd==0xD0 && mfc_ea_range_committed(ea,16)) {
+      if(s_ct && ctx->image_id==spu_cri_image() && cmd==0xD0 && mfc_ea_range_committed(ea,16)) {
         static int _c=0; if(PS3_LOG_FIRST(_c, 24)){
           uint8_t* m=vm_base+ea;
           #define BW(o) (((uint32_t)m[o]<<24)|((uint32_t)m[o+1]<<16)|((uint32_t)m[o+2]<<8)|m[o+3])
@@ -2402,7 +2402,7 @@ void spu_spurs_taskset_syscall(spu_context* ctx)   /* non-static: also called by
      * woken). Honour the first call, halt on the rest. Each task runs on its own
      * host thread, so a thread-local count is per task. */
     static _Thread_local int s_exit_seen = 0;
-    if (num == 0 && ctx->image_id == 22 && !getenv("YDKJ_CRI_EXIT_HALT")) {
+    if (num == 0 && ctx->image_id == spu_cri_image() && !getenv("YDKJ_CRI_EXIT_HALT")) {
         if (s_exit_seen++ == 0) { ctx->gpr[3]._u32[0] = 0; return; }   /* bootstrap */
         { static int _n = 0; if (PS3_LOG_FIRST(_n, 8))
             fprintf(stderr, "[spu] cri task EXIT #%d -- halting (was spinning)\n",
@@ -2411,7 +2411,7 @@ void spu_spurs_taskset_syscall(spu_context* ctx)   /* non-static: also called by
         spu_halt(ctx);
         return;
     }
-    if (num == 0 && (ctx->image_id != 22 || getenv("YDKJ_CRI_EXIT_HALT"))) {
+    if (num == 0 && (ctx->image_id != spu_cri_image() || getenv("YDKJ_CRI_EXIT_HALT"))) {
         ctx->status = SPU_STATUS_STOPPED_BY_STOP;
         spu_halt(ctx);          /* longjmp out to spu_run_with_halt; post-run writes exit code */
         return;
@@ -2491,8 +2491,8 @@ void spu_spurs_taskset_syscall(spu_context* ctx)   /* non-static: also called by
             extern volatile uint32_t g_spu_lfq_push_gen;
             uint32_t lfq_gen = __atomic_load_n(&g_spu_lfq_push_gen, __ATOMIC_SEQ_CST);
             if (spu_taskset_consume_wake(ts) ||   /* a Set beat us to the park */
-                spu_lfq_wait_satisfied(wobj) ||   /* or the queue already has work */
-                lfq_gen != t_lfq_gen) {
+                (wobj && (spu_lfq_wait_satisfied(wobj) || /* queue-backed waits only */
+                          lfq_gen != t_lfq_gen))) {
                 t_lfq_gen = lfq_gen;
                 spu_ef_deliver_owed(ctx, wobj);
                 ctx->gpr[3]._u32[0] = 0;
@@ -2505,7 +2505,7 @@ void spu_spurs_taskset_syscall(spu_context* ctx)   /* non-static: also called by
              * parked list; with a full fence on both sides one sees the other. */
             __atomic_thread_fence(__ATOMIC_SEQ_CST);
             lfq_gen = __atomic_load_n(&g_spu_lfq_push_gen, __ATOMIC_SEQ_CST);
-            if (spu_lfq_wait_satisfied(wobj) || lfq_gen != t_lfq_gen) {
+            if (wobj && (spu_lfq_wait_satisfied(wobj) || lfq_gen != t_lfq_gen)) {
                 t_lfq_gen = lfq_gen;
                 spu_taskset_parked_del(ts, tid);
                 yz_lockstep_block_end(ctx);
@@ -2833,7 +2833,7 @@ void spu_indirect_branch(spu_context* ctx)
             (ctx->resident_task && spu_lookup(SPURS_TASKSET_PM_SYSCALL_LS, ctx->resident_task)) ||
             (ctx->resident_ovl  && spu_lookup(SPURS_TASKSET_PM_SYSCALL_LS, ctx->resident_ovl));
         int standalone = !ctx->policy_mode && sc == SPURS_TASKSET_PM_SYSCALL_LS && !lifted;
-        if (ctx->image_id == 22 || standalone ||
+        if (ctx->image_id == spu_cri_image() || standalone ||
             (ctx->policy_mode && sc == SPURS_TASKSET_PM_SYSCALL_LS)) {
             spu_spurs_taskset_syscall(ctx);
             ctx->pc = ctx->gpr[0]._u32[0] & SPU_LS_MASK;
@@ -3028,7 +3028,10 @@ void spu_indirect_branch(spu_context* ctx)
               if (PS3_LOG_FIRST(_n, 8))
                   fprintf(stderr, "[spu] img=%d interpreting unlifted LS 0x%05X "
                           "(runtime-loaded code)\n", ctx->image_id, p);
-              spu_interp_run(ctx, p);
+              /* The interpreter stops at the first lifted PC. Dispatch that
+               * continuation too: otherwise the overlay's return is dropped
+               * and the caller observes a half-executed SPU function. */
+              spu_dispatch(ctx, p);
               return;
           } }
         spu_halt(ctx);

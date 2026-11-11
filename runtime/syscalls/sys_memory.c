@@ -78,28 +78,40 @@ static void write_be32(uint32_t addr, uint32_t val)
  * The small runtime-injected window is reserved even when a port relocates it
  * into this domain, and loaded ELF data/BSS remain owned by the image.
  * Use 64-bit arithmetic for every exclusive range end. */
+typedef struct user_range { uint64_t start, end; } user_range;
+static int user_range_compare(const void* lhs, const void* rhs)
+{
+    const user_range* a = lhs; const user_range* b = rhs;
+    return (a->start > b->start) - (a->start < b->start);
+}
 static uint32_t user_address(uint32_t size, uint32_t alignment)
 {
+    /* Sort once and scan once. Restarting a full table scan after every live
+     * page made many 64 KiB allocations cubic in the number of pages. */
+    user_range ranges[SYS_MEMORY_ALLOC_MAX + 2];
+    size_t n = 0;
+    ranges[n++] = (user_range){VM_HLE_INJECT_BASE,
+                              (uint64_t)VM_HLE_INJECT_BASE + VM_HLE_INJECT_SIZE};
+    ranges[n++] = (user_range){VM_PPU_TLS_BASE,
+                              (uint64_t)VM_PPU_TLS_BASE + VM_PPU_TLS_SIZE};
+    for (int i = 0; i < SYS_MEMORY_ALLOC_MAX; ++i) {
+        const sys_mem_alloc_info* a = &g_sys_mem_allocs[i];
+        if (a->active) ranges[n++] = (user_range){a->addr, (uint64_t)a->addr + a->size};
+    }
+    qsort(ranges, n, sizeof(ranges[0]), user_range_compare);
     uint64_t candidate = SYS_MEM_ALLOC_BASE;
+    size_t i = 0;
     for (;;) {
         candidate = (candidate + alignment - 1u) & ~(uint64_t)(alignment - 1u);
         if (candidate + size > SYS_MEM_ALLOC_END) return 0;
-        uint64_t next = s_image_query ? s_image_query(candidate, candidate + size) : candidate;
-        uint64_t injected = VM_HLE_INJECT_BASE;
-        if (candidate < injected + VM_HLE_INJECT_SIZE && injected < candidate + size &&
-            injected + VM_HLE_INJECT_SIZE > next)
-            next = injected + VM_HLE_INJECT_SIZE;
-        if (candidate < (uint64_t)VM_PPU_TLS_BASE + VM_PPU_TLS_SIZE &&
-            VM_PPU_TLS_BASE < candidate + size && (uint64_t)VM_PPU_TLS_BASE + VM_PPU_TLS_SIZE > next)
-            next = (uint64_t)VM_PPU_TLS_BASE + VM_PPU_TLS_SIZE;
-        for (int i = 0; i < SYS_MEMORY_ALLOC_MAX; ++i) {
-            const sys_mem_alloc_info* a = &g_sys_mem_allocs[i];
-            uint64_t end = (uint64_t)a->addr + a->size;
-            if (a->active && candidate < end && a->addr < candidate + size && end > next)
-                next = end;
-        }
-        if (next == candidate) return (uint32_t)candidate;
-        candidate = next;
+        const uint64_t image_end = s_image_query
+            ? s_image_query(candidate, candidate + size) : candidate;
+        if (image_end > candidate) { candidate = image_end; continue; }
+        while (i < n && ranges[i].end <= candidate) ++i;
+        if (i == n || candidate + size <= ranges[i].start)
+            return (uint32_t)candidate;
+        if (ranges[i].end > candidate) candidate = ranges[i].end;
+        ++i;
     }
 }
 
@@ -115,6 +127,9 @@ static int64_t memory_allocate(uint64_t requested, uint32_t flags, uint32_t cid,
     uint32_t size = (uint32_t)rounded;
     bump_lock();
     if (size > SYS_MEM_USER_TOTAL - s_total_allocated) {
+        if (getenv("PS3_MEM_FAIL_TRACE"))
+            fprintf(stderr, "[mem-fail] requested=0x%X used=0x%X total=0x%X (pool limit)\n",
+                    size, s_total_allocated, SYS_MEM_USER_TOTAL);
         bump_unlock(); return (int64_t)(int32_t)CELL_ENOMEM;
     }
     sys_mem_container_info* ct = NULL;
@@ -146,6 +161,17 @@ static int64_t memory_allocate(uint64_t requested, uint32_t flags, uint32_t cid,
 
 int64_t sys_memory_allocate(ppu_context* ctx)
 {
+    if (getenv("PS3_MEM_CALLER") && LV2_ARG_U64(ctx, 0) <= 0x10000u) {
+        static unsigned n;
+        if (++n <= 8 || n % 500 == 0)
+            fprintf(stderr, "[mem-caller] n=%u req=0x%llX lr=0x%08X tid=%llu\n",
+                    n, (unsigned long long)LV2_ARG_U64(ctx, 0),
+                    (unsigned)ctx->lr, (unsigned long long)ctx->thread_id);
+        if (n == 500 || n == 2500) {
+            extern void ppu_log_host_chain(const char*);
+            ppu_log_host_chain("memory-64k");
+        }
+    }
     return memory_allocate(LV2_ARG_U64(ctx, 0), LV2_ARG_U32(ctx, 1), 0, LV2_ARG_PTR(ctx, 2));
 }
 
@@ -177,6 +203,12 @@ int64_t sys_memory_allocate_from_container(ppu_context* ctx)
 int64_t sys_memory_free(ppu_context* ctx)
 {
     uint32_t addr = LV2_ARG_U32(ctx, 0);
+    if (getenv("PS3_MEM_CALLER")) {
+        static unsigned n;
+        if (++n <= 8 || n % 500 == 0)
+            fprintf(stderr, "[mem-free] n=%u addr=0x%08X lr=0x%08X tid=%llu\n",
+                    n, addr, (unsigned)ctx->lr, (unsigned long long)ctx->thread_id);
+    }
     bump_lock();
     for (int i = 0; i < SYS_MEMORY_ALLOC_MAX; i++) {
         if (g_sys_mem_allocs[i].active && g_sys_mem_allocs[i].addr == addr) {

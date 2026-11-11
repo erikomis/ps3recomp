@@ -167,6 +167,16 @@ static float s_mix_buffer[CELL_AUDIO_BLOCK_SAMPLES * 2];
 
 #if AUDIO_BACKEND_SDL2
 
+/* ASURA_AUDIO_DIAG: on when set to anything but "" or "0" (so =0 is off).
+ * Observation only. */
+static int audio_diag_on(void)
+{
+    static int s_on = -1;
+    if (s_on < 0) { const char* e = getenv("ASURA_AUDIO_DIAG");
+                    s_on = (e && *e && strcmp(e, "0") != 0) ? 1 : 0; }
+    return s_on;
+}
+
 static SDL_AudioDeviceID s_sdl_audio_dev = 0;
 
 static int audio_backend_init(void)
@@ -193,6 +203,22 @@ static int audio_backend_init(void)
     }
 
     SDL_PauseAudioDevice(s_sdl_audio_dev, 0); /* Start playback */
+    if (audio_diag_on()) {
+        /* ASURA_AUDIO_DIAG: what SDL actually gave us. Observation only; the
+         * requested spec above and the unpause are unchanged. */
+        const char* drv = SDL_GetCurrentAudioDriver();
+        fprintf(stderr, "[asura-audio] SDL open: driver=%s dev=%u want=%dHz/%uch/%u"
+                        " have=%dHz/%uch/%u fmt=0x%04X status=%d (0 stopped, 1 playing, 2 paused)\n",
+                drv ? drv : "?", (unsigned)s_sdl_audio_dev,
+                want.freq, (unsigned)want.channels, (unsigned)want.samples,
+                have.freq, (unsigned)have.channels, (unsigned)have.samples,
+                (unsigned)have.format, (int)SDL_GetAudioDeviceStatus(s_sdl_audio_dev));
+        const int nd = SDL_GetNumAudioDevices(0);
+        for (int i = 0; i < nd && i < 8; ++i) {
+            const char* nm = SDL_GetAudioDeviceName(i, 0);
+            fprintf(stderr, "[asura-audio] SDL output device %d: %s\n", i, nm ? nm : "?");
+        }
+    }
     return 0;
 }
 
@@ -207,8 +233,40 @@ static void audio_backend_shutdown(void)
 static void audio_backend_submit(const float* stereo_samples, u32 num_samples)
 {
     if (s_sdl_audio_dev) {
-        SDL_QueueAudio(s_sdl_audio_dev, stereo_samples,
-                       num_samples * 2 * sizeof(float));
+        const int qrc = SDL_QueueAudio(s_sdl_audio_dev, stereo_samples,
+                                       num_samples * 2 * sizeof(float));
+        char qerr[96]; qerr[0] = 0;
+        if (qrc != 0 && audio_diag_on()) {   /* copy the error before any other SDL call */
+            const char* e = SDL_GetError();
+            snprintf(qerr, sizeof qerr, "%s", e ? e : "");
+        }
+        if (audio_diag_on()) {
+            /* ASURA_AUDIO_DIAG: SDL_QueueAudio's return value was never looked at.
+             * Count blocks, failures and queue depth; one summary line per ~1 s
+             * of audio (188 blocks of 256 frames). The mixer thread is the only
+             * caller, so plain counters are enough. */
+            static unsigned long long s_blocks, s_fail, s_sum_q; static unsigned s_win, s_max_q;
+            static unsigned s_min_q = 0xFFFFFFFFu; static int s_err_logged;
+            const unsigned q = SDL_GetQueuedAudioSize(s_sdl_audio_dev);
+            s_blocks++; s_win++; s_sum_q += q;
+            if (q > s_max_q) s_max_q = q;
+            if (q < s_min_q) s_min_q = q;
+            if (qrc != 0) {
+                s_fail++;
+                if (s_err_logged < 8) {
+                    s_err_logged++;
+                    fprintf(stderr, "[asura-audio] SDL_QueueAudio failed (rc=%d): %s\n",
+                            qrc, qerr);
+                }
+            }
+            if (s_win >= 188) {
+                fprintf(stderr, "[asura-audio] SDL queue: blocks=%llu failed=%llu queued_bytes"
+                                " avg=%llu min=%u max=%u status=%d\n",
+                        s_blocks, s_fail, s_sum_q / s_win, s_min_q, s_max_q,
+                        (int)SDL_GetAudioDeviceStatus(s_sdl_audio_dev));
+                s_win = 0; s_sum_q = 0; s_max_q = 0; s_min_q = 0xFFFFFFFFu;
+            }
+        }
     }
 }
 

@@ -21,8 +21,9 @@ extern "C" {
 #define SYS_MEMORY_PAGE_SIZE_1M   0x400
 #define SYS_MEMORY_PAGE_SIZE_64K  0x200
 
-/* Maximum tracked allocations */
-#define SYS_MEMORY_ALLOC_MAX      1024
+/* Every 64 KiB page in the 256 MiB user address domain may be a separate
+ * allocation. A smaller record table reports ENOMEM before the byte budget. */
+#define SYS_MEMORY_ALLOC_MAX      4096
 #define SYS_MEMORY_CONTAINER_MAX  16
 #define SYS_MMAPPER_SHARED_MAX    64
 

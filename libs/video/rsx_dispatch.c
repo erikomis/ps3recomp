@@ -46,6 +46,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include "ps3emu/log_first.h"
+#include "rsx_blend_log.h"
 
 #define M_DMA_COLOR1            0x018C
 #define M_DMA_COLOR0            0x0194
@@ -329,6 +330,26 @@ void rsx_dispatch_method(rsx_dispatch* rsx, u32 method, u32 arg)
     }
     rsx->seen[idx]++;
     rsx->regs[idx] = arg;
+#if RSX_BLEND_LOG_AVAILABLE
+    /* RSX_BLEND_LOG: every SET_BLEND_COLOR write (0x031C; 0x0390 is the upper half
+     * for an FP16 target). Log-only. The method is tested before the gate, so this
+     * costs one compare per method when the log is off. */
+    if ((method == 0x031Cu || method == 0x0390u) && rsx_blend_log_on()) {
+        static unsigned long long s_total; static int s_budget; static long long s_t;
+        const unsigned long long n = RSX_BLEND_LOG_ADD(&s_total, 1ull);
+        char line[160];
+        if (rsx_blend_log_budget(&s_budget, 40)) {
+            snprintf(line, sizeof line, "[blend] SET_BLEND_COLOR%s = 0x%08X (write #%llu)\n",
+                     method == 0x0390u ? "_FP16HI" : "", arg, n);
+            fputs(line, stderr);
+        }
+        if (rsx_blend_log_tick(&s_t, 5000)) {
+            snprintf(line, sizeof line, "[blend] SET_BLEND_COLOR writes so far: %llu\n",
+                     RSX_BLEND_LOG_LOAD(&s_total));
+            fputs(line, stderr);
+        }
+    }
+#endif
     if ((method >= 0x1500 && method < 0x1A00) || (method >= 0x1E40 && method < 0x1E80) ||
         (method >= 0x0A80 && method < 0x0B00))
         vtx_const_fold(rsx, method, arg);

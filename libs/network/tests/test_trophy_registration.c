@@ -44,6 +44,23 @@ int main(void)
     assert(calls == 1 && s_contexts[1].registered);
     cellSysutilCheckCallback(); assert(calls == 2);
     cellSysutilCheckCallback(); assert(calls == 2);
+    /* HLE numeric fields are big-endian; strings keep their byte order. */
+    assert(sceNpTrophyGetGameInfo(1, 1, (void*)0x1000, (void*)0x2000) == CELL_OK);
+    assert(vm_read32(0x1000) == 32 && vm_read32(0x1004) == 1);
+    assert(vm_read32(0x1008) == 2 && vm_read32(0x100C) == 8);
+    assert(vm_read32(0x1010) == 21);
+    assert(!strcmp((char*)vm_base + 0x1014, "PS3 Game"));
+    s_contexts[1].unlocked[5] = 1;
+    s_contexts[1].unlock_time[5] = 0x0102030405060708ull;
+    assert(sceNpTrophyGetGameInfo(1, 1, NULL, (void*)0x2000) == CELL_OK);
+    assert(vm_read32(0x2000) == 1 && vm_read32(0x2010) == 1);
+    assert(sceNpTrophyGetTrophyInfo(1, 1, 5, (void*)0x3000, (void*)0x4000) == CELL_OK);
+    assert(vm_read32(0x3000) == 5 && vm_read32(0x3004) == SCE_NP_TROPHY_GRADE_BRONZE);
+    assert(!strcmp((char*)vm_base + 0x3008, "Trophy 5"));
+    assert(vm_read64(0x4000) == 0x0102030405060708ull);
+    assert(vm_read32(0x4008) == 5 && vm_base[0x400C] == 1);
+    assert(sizeof(SceNpTrophyDetails) == 1164);
+    assert(sizeof(SceNpTrophyGameDetails) == 1176);
     assert(sceNpTrophyTerm() == CELL_OK);
     char file[256]; snprintf(file, sizeof(file), "%s/NPWR00000.json", root);
     assert(unlink(file) == 0); assert(rmdir(root) == 0); free(vm_base);

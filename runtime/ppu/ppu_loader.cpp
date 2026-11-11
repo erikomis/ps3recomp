@@ -4276,7 +4276,6 @@ extern "C" int ppu_run(uint32_t entry_opd, uint32_t stack_top)
  * so this is the only reliable caller-chain view. */
 extern "C" void ppu_log_host_chain(const char* tag)
 {
-#ifdef _WIN32
     void* bt[48]; unsigned short fr = RtlCaptureStackBackTrace(0, 48, bt, 0);
     char b[1800]; int p = snprintf(b, sizeof b, "[CHAIN:%s]", tag ? tag : "?");
     for (int i = 0; i < fr; i++) {
@@ -4289,9 +4288,6 @@ extern "C" void ppu_log_host_chain(const char* tag)
             p += snprintf(b + p, sizeof(b) - p, " %08X", bg);
     }
     fprintf(stderr, "%s\n", b);
-#else
-    (void)tag;
-#endif
 }
 
 /* Re-added on the faithful-adopt-caner fold: ppu_fs.cpp (kept from ydkj) calls this. */

@@ -586,6 +586,14 @@ static void pad_sdl_close(int p, int gone)
 /* Open every game controller SDL lists that no port has yet. */
 static void pad_sdl_scan(void)
 {
+    /* PAD_NO_CONTROLLER=1: leave physical controllers closed. A scripted run
+     * (PAD_SCRIPT) is only reproducible when nothing else presses buttons: a
+     * controller left plugged in, with a drifting stick or a hand on it,
+     * moved the cursor between the script's presses and each headless probe
+     * of the same script ended on a different menu. */
+    { static int off = -1;
+      if (off < 0) off = getenv("PAD_NO_CONTROLLER") ? 1 : 0;
+      if (off) return; }
     const int n = SDL_NumJoysticks();   /* also refreshes sdl2-compat's index list */
     for (int idx = 0; idx < n; idx++) {
         if (!SDL_IsGameController(idx)) continue;

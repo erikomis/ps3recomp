@@ -44,7 +44,7 @@ extern "C" {
 
 #define SCE_NP_TROPHY_MAX_NUM_TROPHIES      128
 #define SCE_NP_TROPHY_NAME_MAX_SIZE         128
-#define SCE_NP_TROPHY_DESC_MAX_SIZE         256
+#define SCE_NP_TROPHY_DESC_MAX_SIZE         1024
 #define SCE_NP_TROPHY_GAME_TITLE_MAX_SIZE   128
 #define SCE_NP_TROPHY_GAME_DESC_MAX_SIZE    1024
 
@@ -89,6 +89,7 @@ typedef struct SceNpTrophyGameDetails {
     u32  numBronze;
     char title[SCE_NP_TROPHY_GAME_TITLE_MAX_SIZE];
     char description[SCE_NP_TROPHY_GAME_DESC_MAX_SIZE];
+    u8 reserved[4];
 } SceNpTrophyGameDetails;
 
 typedef struct SceNpTrophyGameData {

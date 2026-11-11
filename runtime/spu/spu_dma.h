@@ -165,6 +165,71 @@ static inline int mfc_is_fence(uint32_t cmd)
     return (cmd & 0x02) != 0; /* fence variants have bit 1 set */
 }
 
+/* ---------------------------------------------------------------------------
+ * ASURA_AUDIO_DIAG helpers (instrumentation only; no effect on any transfer).
+ * A variable counts as ON when it is set to anything but "" or "0" -- so
+ * ASURA_AUDIO_DIAG=0 really turns it off. The counters are shared by every
+ * SPU thread, so they need real atomics: with GCC/Clang they use __atomic;
+ * with any other compiler the diagnostic is compiled out (always off) instead
+ * of racing on plain integers.
+ * -------------------------------------------------------------------------*/
+#if defined(__GNUC__) || defined(__clang__)
+#  define ASURA_AUDIO_DIAG_AVAILABLE 1
+#  define ASURA_ATOMIC_ADD64(p, v) __atomic_add_fetch((p), (v), __ATOMIC_RELAXED)
+#  define ASURA_ATOMIC_LOAD_INT(p) __atomic_load_n((p), __ATOMIC_RELAXED)
+#  define ASURA_ATOMIC_STORE_INT(p, v) __atomic_store_n((p), (v), __ATOMIC_RELAXED)
+#else
+#  define ASURA_AUDIO_DIAG_AVAILABLE 0
+#endif
+
+static inline int asura_audio_env_on(const char* name)
+{
+    const char* e = getenv(name);
+    return (e && *e && strcmp(e, "0") != 0) ? 1 : 0;
+}
+
+#if ASURA_AUDIO_DIAG_AVAILABLE
+/* Cached read of an on/off variable: -1 unread, 0 off, 1 on. A repeated first
+ * read by two threads is harmless (same answer). */
+static inline int asura_audio_flag(int* cache, const char* name)
+{
+    int v = ASURA_ATOMIC_LOAD_INT(cache);
+    if (v < 0) { v = asura_audio_env_on(name); ASURA_ATOMIC_STORE_INT(cache, v); }
+    return v;
+}
+
+static inline int asura_audio_diag_on(void)
+{
+    static int s_on = -1;
+    return asura_audio_flag(&s_on, "ASURA_AUDIO_DIAG");
+}
+
+static inline int asura_audio_any_on(void)
+{
+    static int s_any = -1;
+    return asura_audio_flag(&s_any, "ASURA_AUDIO_DIAG_ANY");
+}
+
+/* True for the first `limit` calls on this counter. Saturating: the counter
+ * never passes `limit`, so it cannot wrap and reopen the log, and once the
+ * budget is spent a call is a single load. */
+static inline int asura_audio_budget(int* ctr, int limit)
+{
+    int v = ASURA_ATOMIC_LOAD_INT(ctr);
+    while (v < limit) {
+        if (__atomic_compare_exchange_n(ctr, &v, v + 1, 0,
+                                        __ATOMIC_RELAXED, __ATOMIC_RELAXED))
+            return 1;
+    }
+    return 0;
+}
+#else
+static inline int asura_audio_diag_on(void) { return 0; }
+static inline int asura_audio_any_on(void) { return 0; }
+static inline int asura_audio_budget(int* ctr, int limit) { (void)ctr; (void)limit; return 0; }
+#  define ASURA_ATOMIC_ADD64(p, v) (*(p) += (v))   /* unreachable: diag is off */
+#endif
+
 /*
  * Execute a single DMA transfer between local store and main memory.
  * Returns 0 on success, -1 on error.
@@ -222,6 +287,23 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
                               " size=%u covers 0x%08X\n",
                       (uint32_t)spu->pc & SPU_LS_MASK, cmd, lsa, (uint32_t)ea, size,
                       (uint32_t)s_w); } }
+    /* SPU_PUT_VALWATCH=<hex EA>: every PUT covering that word, with the 32-bit
+     * value it carries and what was there before. An address watch says who
+     * writes a counter; a counter that several jobs write only shows what went
+     * wrong once the VALUES are in order of arrival (a later job landing
+     * before an earlier one leaves it lower than its waiter needs). */
+    { static uint32_t s_vw = 1;
+      if (s_vw == 1) { const char* e = getenv("SPU_PUT_VALWATCH"); s_vw = e ? (uint32_t)strtoul(e, 0, 16) : 0; }
+      if (s_vw && mfc_is_put(cmd) && (uint32_t)ea <= s_vw && (uint32_t)ea + size >= s_vw + 4u) {
+          extern uint8_t* vm_base;
+          const uint8_t* src = spu->ls + ((lsa + (s_vw - (uint32_t)ea)) & SPU_LS_MASK);
+          const uint8_t* old = vm_base + s_vw;
+          static unsigned long _n = 0;
+          if (++_n <= 4000)
+              fprintf(stderr, "[put-val] #%lu img=%d spu=%X pc=0x%05X ea=0x%08X size=%u new=0x%02X%02X%02X%02X old=0x%02X%02X%02X%02X\n",
+                      _n, spu->image_id, spu->spu_id, (uint32_t)spu->pc & SPU_LS_MASK, (uint32_t)ea, size,
+                      src[0], src[1], src[2], src[3], old[0], old[1], old[2], old[3]);
+      } }
     /* SPU_DMA_RANGE=<lo>-<hi> (hex EAs): log transfers touching [lo,hi), first
      * 64 -- who reads or writes a buffer the RSX shares with the SPUs. */
     { static uint32_t s_lo = 1, s_hi;
@@ -272,6 +354,32 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
                            (uint32_t)ea < g_ps3_ro_image_hi &&
                            (uint32_t)ea + size > g_ps3_ro_image_lo);
           if (malformed) {
+              /* ASURA_AUDIO_DIAG: instrumentation only. A GET that arrives with
+               * size 0 from the MultiStream job (image 1, pc 0x0B1C8 -- where the
+               * counts come from the header r80 points at, see
+               * spu_func_0000B064/B1C8 in port/spu/spu_0000_at_017AA900). The
+               * transfer is rejected exactly as before. Any other task is ignored
+               * unless ASURA_AUDIO_DIAG_ANY is also set, so it cannot eat the
+               * budget of 8 lines. One fputs per line: lines do not interleave. */
+              if (size == 0 && mfc_is_get(cmd) && asura_audio_diag_on() &&
+                  ((spu->image_id == 1 && ((uint32_t)spu->pc & SPU_LS_MASK) == 0x0B1C8u) ||
+                   asura_audio_any_on())) {
+                  static int _nd = 0;
+                  if (asura_audio_budget(&_nd, 8)) {
+                      const uint32_t raw = spu->gpr[80]._u32[0];
+                      const uint32_t h = raw & (SPU_LS_MASK & ~15u);
+                      char line[320]; int n = snprintf(line, sizeof line,
+                          "[asura-audio] empty GET img=%d pc=0x%05X lsa=0x%05X ea=0x%08X"
+                          " r80_raw=0x%08X hdr_ls=0x%05X hdr=",
+                          spu->image_id, (uint32_t)spu->pc & SPU_LS_MASK, lsa,
+                          (uint32_t)ea, raw, h);
+                      for (unsigned k = 0; k < 32 && n > 0 && n < (int)sizeof line - 4; ++k)
+                          n += snprintf(line + n, sizeof line - n, "%02X",
+                                        spu->ls[(h + k) & SPU_LS_MASK]);
+                      if (n > 0 && n < (int)sizeof line - 2) { line[n++] = '\n'; line[n] = 0; }
+                      fputs(line, stderr);
+                  }
+              }
               static int _n = 0;
               if (PS3_LOG_FIRST(_n, 8))
                   fprintf(stderr, "[mfc] REJECTED malformed transfer: img=%d pc=0x%05X"
@@ -443,6 +551,34 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
         return -1;
     }
 
+    /* ASURA_AUDIO_DIAG: instrumentation only. Counts the GET/PUT transfers that
+     * reach this point (every check above passed, the copy happens next -- SDCRZ
+     * and the storage controls return earlier and are not counted; a DMA list
+     * counts each element that gets here, not the list) and that overlap
+     * the cellAudio window [VM_AUDIO_BASE 0x58000000, +2 MiB): the port rings
+     * GetPortConfig hands out (0x58000000, 64 KiB for port 0) and the read-index
+     * words (0x58100000). SPU_MFC_TRACE's ring-PUT filter does not cover it.
+     * Counters are atomic; they are per translation unit because this header is
+     * included by several. The first 24 transfers are logged, then one line per
+     * 65536. The transfer itself is untouched. */
+    if ((uint64_t)(uint32_t)ea < 0x58200000ull &&
+        (uint64_t)(uint32_t)ea + size > 0x58000000ull &&
+        (mfc_is_get(cmd) || mfc_is_put(cmd)) && asura_audio_diag_on()) {
+        static unsigned long long s_cnt[2], s_bytes[2]; static int _na = 0;
+        const int put = mfc_is_put(cmd) ? 1 : 0;
+        const unsigned long long n = ASURA_ATOMIC_ADD64(&s_cnt[put], 1ull);
+        const unsigned long long b = ASURA_ATOMIC_ADD64(&s_bytes[put], (unsigned long long)size);
+        if (asura_audio_budget(&_na, 24) || (n & 0xFFFFull) == 0) {
+            char line[200];
+            snprintf(line, sizeof line,
+                     "[asura-audio] %s img=%d pc=0x%05X ea=0x%08X size=%u lsa=0x%05X"
+                     " n=%llu bytes=%llu\n",
+                     put ? "PUT" : "GET", spu->image_id, (uint32_t)spu->pc & SPU_LS_MASK,
+                     (uint32_t)ea, size, lsa, n, b);
+            fputs(line, stderr);
+        }
+    }
+
     uint8_t* ls_ptr = &spu->ls[lsa];
     uint8_t* ea_ptr = vm_base + (uint32_t)ea; /* PS3 uses 32-bit effective addresses for SPU DMA */
 
@@ -494,7 +630,7 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
      * (large, from a non-context EA) as opposed to the 64-byte context handshake
      * DMAs. Set a flag the dispatcher polls to know the task got real work. */
     { extern int g_cri_video_dma;
-      if (spu->image_id == 22 && mfc_is_get(cmd) && size > 0x100)
+      if (spu->image_id == spu_cri_image() && mfc_is_get(cmd) && size > 0x100)
           g_cri_video_dma = 1; }
     /* SPU_DSP_IMAGE_EA -- recover an SPU image load whose source address the
      * title lost. You Don't Know Jack's FMOD mixer relocates a DSP plugin into
@@ -1422,7 +1558,7 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
                            only==-3 ? "ALL images" : "one image id "
                                                      "(a bare number is an IMAGE ID, not on/off)");
         }
-        if ((dt && (spu->image_id==22 || spu->image_id==23)) ||
+        if ((dt && (spu->image_id==spu_cri_image() || spu->image_id==23)) ||
             only==-3 || (only >= 0 && spu->image_id == only)) {
             static int _n=0; if (PS3_LOG_FIRST(_n, 160))
                 fprintf(stderr, "[DMA] img%d cmd=0x%02X lsa=0x%05X ea=0x%09llX size=0x%X tag=%u\n",
@@ -1642,7 +1778,7 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
      * can tell if eaContext holds valid SPURS work data or garbage. */
     {
         static int64_t dt2=-2; if (dt2==-2){ const char* e=getenv("SPU_DMATRACE_ALL"); dt2=e?1:0; }
-        if (dt2 && spu->image_id==22 && cmd==0x40 /*GET*/ && size<=0x80) {
+        if (dt2 && spu->image_id==spu_cri_image() && cmd==0x40 /*GET*/ && size<=0x80) {
             static int _g=0; if (PS3_LOG_FIRST(_g, 6)) {
                 const uint8_t* p = spu->ls + (lsa & 0x3FFFF);
                 fprintf(stderr, "[DMA] GET data @LS0x%05X (from ea=0x%09llX):", lsa, (unsigned long long)ea);

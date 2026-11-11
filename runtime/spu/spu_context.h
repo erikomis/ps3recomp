@@ -17,6 +17,24 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+/* SPU_CRI_IMAGE=<id>: which lifted image is You Don't Know Jack's CRI movie
+ * task (cri_mpvps3spurs.elf). The runtime carries a dozen special cases for
+ * it -- its own SpursTasksetContext plant, exit handling, syscall routing --
+ * and they were all written against the literal image id 22, the slot that
+ * ELF has in that title. Image ids are just a title's embedded SPU ELFs in
+ * order, so in any other title image 22 is something else: in Asura's Wrath
+ * it is the PhysX task (spu_0021_at_018ECF00), which was handed the CRI
+ * context, read its queue and parameter EAs out of the wrong place (GETs from
+ * EA 0, GETLLAR spinning on 0x00400000) and never finished a simulation step,
+ * so the first map hung with the main thread waiting on physics. Default 22
+ * keeps that title as it was; 0 means "this title has no such image". */
+static inline int spu_cri_image(void)
+{
+    static int v = -1;
+    if (v < 0) { const char* e = getenv("SPU_CRI_IMAGE"); v = e ? atoi(e) : 22; }
+    return v;
+}
+
 #ifdef __cplusplus
 extern "C" {
 #endif

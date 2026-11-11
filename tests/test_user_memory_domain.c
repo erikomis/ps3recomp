@@ -47,6 +47,10 @@ int main(void) {
  CHECK(vm_base[VM_PPU_TLS_BASE]==0xA5);
  uint32_t before=out(); CHECK(allocate(0x10000,0x200)!=(int64_t)CELL_OK); CHECK(out()==before);
  reset();
+ /* Many small allocations must reach the same byte budget as one large one. */
+ for(unsigned page=0;page<213u*16u;page++) CHECK(allocate(0x10000,0x200)==CELL_OK);
+ CHECK(allocate(0x10000,0x200)!=(int64_t)CELL_OK);
+ reset();
  ppu_hle_inject_base=0x10000000u;
  CHECK(allocate(0x10000,0x200)==CELL_OK);CHECK(out()>=0x11000000u);
  ppu_hle_inject_base=0x20000000u;

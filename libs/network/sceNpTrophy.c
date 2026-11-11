@@ -409,11 +409,11 @@ s32 sceNpTrophyGetGameInfo(SceNpTrophyContext context,
 
     if (details) {
         memset(details, 0, sizeof(SceNpTrophyGameDetails));
-        details->numTrophies = 32; /* default trophy set */
-        details->numPlatinum = 1;
-        details->numGold     = 2;
-        details->numSilver   = 8;
-        details->numBronze   = 21;
+        details->numTrophies = ps3_bswap32(32); /* default trophy set */
+        details->numPlatinum = ps3_bswap32(1);
+        details->numGold     = ps3_bswap32(2);
+        details->numSilver   = ps3_bswap32(8);
+        details->numBronze   = ps3_bswap32(21);
         strncpy(details->title, "PS3 Game",
                 SCE_NP_TROPHY_GAME_TITLE_MAX_SIZE - 1);
         strncpy(details->description, "Trophy set",
@@ -422,7 +422,7 @@ s32 sceNpTrophyGetGameInfo(SceNpTrophyContext context,
 
     if (data) {
         memset(data, 0, sizeof(SceNpTrophyGameData));
-        data->unlockedTrophies = trophy_count_unlocked(&s_contexts[context]);
+        data->unlockedTrophies = ps3_bswap32(trophy_count_unlocked(&s_contexts[context]));
         /* Count by grade would require per-trophy grade data;
          * return conservative estimates */
         data->unlockedPlatinum = 0;
@@ -460,8 +460,8 @@ s32 sceNpTrophyGetTrophyInfo(SceNpTrophyContext context,
 
     if (details) {
         memset(details, 0, sizeof(SceNpTrophyDetails));
-        details->trophyId = (u32)trophyId;
-        details->trophyGrade = SCE_NP_TROPHY_GRADE_BRONZE;
+        details->trophyId = ps3_bswap32((u32)trophyId);
+        details->trophyGrade = ps3_bswap32(SCE_NP_TROPHY_GRADE_BRONZE);
         snprintf(details->name, SCE_NP_TROPHY_NAME_MAX_SIZE,
                  "Trophy %d", trophyId);
         snprintf(details->description, SCE_NP_TROPHY_DESC_MAX_SIZE,
@@ -471,9 +471,9 @@ s32 sceNpTrophyGetTrophyInfo(SceNpTrophyContext context,
 
     if (data) {
         memset(data, 0, sizeof(SceNpTrophyData));
-        data->trophyId = (u32)trophyId;
+        data->trophyId = ps3_bswap32((u32)trophyId);
         data->unlocked = s_contexts[context].unlocked[trophyId];
-        data->timestamp = s_contexts[context].unlock_time[trophyId];
+        data->timestamp = ps3_bswap64(s_contexts[context].unlock_time[trophyId]);
     }
 
     return CELL_OK;

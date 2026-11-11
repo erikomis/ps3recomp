@@ -3800,6 +3800,18 @@ s32 cellSpursQueueAttachLv2EventQueue(u64 queue_ea)
     return CELL_OK;
 }
 
+/* cellSpursQueueDetachLv2EventQueue(CellSpursQueue*) -- the other half.
+ * Attach above binds nothing, so there is nothing to release; but leaving
+ * the import unresolved returns whatever r3 held (the queue EA) as the
+ * result, which a caller that checks it reads as an error. Asura's Wrath
+ * detaches its 40 task queues while the first map loads. */
+s32 cellSpursQueueDetachLv2EventQueue(u64 queue_ea)
+{
+    static int _n = 0;
+    if (PS3_LOG_FIRST(_n, 8)) printf("[cellSpurs] QueueDetachLv2EventQueue(q=0x%08X)\n", (u32)queue_ea);
+    return CELL_OK;
+}
+
 /* _cellSpursLFQueueInitialize(void* pTasksetOrSpurs, CellSpursLFQueue* pQueue,
  *      const void* buffer, u32 size, u32 depth, u32 direction)
  *

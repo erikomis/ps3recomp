@@ -101,6 +101,7 @@ static volatile int s_flip_lock;
  * while it's blocked in the FIFO-wrap recycle callback -- would show a
  * clear+few-draws frame as a visible flicker). */
 static volatile u32 s_flip_request_count = 0;
+static s32 gcm_flip_request(u32 bufferId, int in_fifo);
 
 u32 cellGcm_flip_request_count(void)
 {
@@ -350,6 +351,31 @@ static _Atomic(u64) s_user_pending = 0;
 #define GCM_USER_PENDING_STORE(value) atomic_store(&s_user_pending, (value))
 #define GCM_USER_PENDING_TAKE() atomic_exchange(&s_user_pending, 0)
 #endif
+
+/* GCM_USER_CMD_QUEUE=1: deliver every GCM_SET_USER_COMMAND to the guest handler,
+ * in order, instead of coalescing the ones still pending into the newest.
+ *
+ * The single pending slot above models a cause register: a second command that
+ * the FIFO retires before the pump has run replaces the first, and the handler
+ * runs once. A title whose handler COUNTS its calls then comes up one short.
+ * Asura's Wrath (UE3) advances a fence counter in that handler and its
+ * rendering thread sleeps in func_008736F8 until the counter reaches the fence
+ * it submitted; one coalesced pair left it one behind for good, and the title
+ * froze at a random moment of the intro or the menu (2 boots in 7). On the
+ * console the interrupt thread services each command long before the RSX
+ * reaches the next, so in practice a title sees one call per command.
+ *
+ * Single producer (the FIFO walker), single consumer (the pump, under
+ * GCM_PUMP_TRY_ENTER). */
+#define GCM_USER_RING 256u
+static u32 s_user_ring[GCM_USER_RING];
+static volatile u32 s_user_ring_head = 0, s_user_ring_tail = 0;
+static int gcm_user_cmd_queue_on(void)
+{
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("GCM_USER_CMD_QUEUE"); on = (e && e[0] == '1') ? 1 : 0; }
+    return on;
+}
 
 /* Tile configuration (up to 15 tiles, 8 commonly used) */
 static CellGcmTileInfo s_tiles[CELL_GCM_MAX_TILE_COUNT];
@@ -948,6 +974,43 @@ static DWORD WINAPI gcm_intr_main(LPVOID unused)
 static void* gcm_intr_posix(void* a) { gcm_intr_main(a); return NULL; }
 #endif
 
+#ifndef _WIN32
+#include <unistd.h>
+#endif
+/* GCM_USER_WATCH=1: every 2 s, where the user-command path stands. A fence a
+ * title waits on moves only when (a) the walker retires the command, (b) the
+ * pump takes it and (c) the guest handler returns; the three counters and the
+ * FIFO registers say which of those stopped. */
+static volatile unsigned long s_uw_queued = 0, s_uw_delivered = 0, s_uw_pumps = 0, s_uw_busy = 0;
+static volatile int s_uw_in_handler = 0;
+#ifndef _WIN32
+static void* gcm_user_watch_main(void* unused)
+{
+    (void)unused;
+    for (;;) {
+        sleep(2);
+        fprintf(stderr, "[gcm-watch] queued=%lu delivered=%lu ring=%u/%u pend=%d upend=%d "
+                "pumps=%lu busy=%lu in_handler=%d put=0x%X get=0x%X ref=0x%X walker_get=0x%X flip=%u\n",
+                s_uw_queued, s_uw_delivered, (unsigned)s_user_ring_tail, (unsigned)s_user_ring_head,
+                (int)(s_gcm_pending != 0), (int)(s_user_pending != 0), s_uw_pumps, s_uw_busy,
+                s_uw_in_handler,
+                vm_read32(GCM_CONTROL_GUEST_ADDR + 0), vm_read32(GCM_CONTROL_GUEST_ADDR + 4),
+                vm_read32(GCM_CONTROL_GUEST_ADDR + 8), s_fifo_getoff, (unsigned)s_flip_status);
+    }
+    return NULL;
+}
+#endif
+static void gcm_user_watch_start(void)
+{
+#ifndef _WIN32
+    static volatile int started = 0;
+    if (started) return;
+    started = 1;
+    if (!getenv("GCM_USER_WATCH")) return;
+    pthread_t t; if (pthread_create(&t, NULL, gcm_user_watch_main, NULL) == 0) pthread_detach(t);
+#endif
+}
+
 void ppu_gcm_pump(void)
 {
     /* Every HLE call and timer sleep pumps, tens of thousands of times a
@@ -967,7 +1030,8 @@ void ppu_gcm_pump(void)
 #endif
         return;   /* only the interrupt thread delivers */
     }
-    if (!GCM_PUMP_TRY_ENTER()) return;
+    if (!GCM_PUMP_TRY_ENTER()) { s_uw_busy++; return; }
+    s_uw_pumps++;
     long p = (long)GCM_PENDING_TAKE();
     u64 user = GCM_USER_PENDING_TAKE();
     /* GCM_PUMP_DBG=1: how often each guest handler is actually delivered. */
@@ -979,8 +1043,10 @@ void ppu_gcm_pump(void)
                            calls, nv, nf, s_vblank_count, 10); } }
     if ((p & 1) && s_vblank_handler_opd && g_ps3_guest_caller) {
         ydkj_restore_handler_opd(s_vblank_handler_opd, s_vblank_handler_code);
+        s_uw_in_handler = 1;
         g_ps3_guest_caller(s_vblank_handler_opd, (uint64_t)s_vblank_count,
                            0, 0, 0, 0, 0, 0, 0);
+        s_uw_in_handler = 0;
     }
     if (p & 2) {
         /* Delivery waits for a guest thread to reach an HLE call or a timer
@@ -996,10 +1062,27 @@ void ppu_gcm_pump(void)
         FLIP_UNLOCK();
         if (s_flip_handler_opd && g_ps3_guest_caller) {
             ydkj_restore_handler_opd(s_flip_handler_opd, s_flip_handler_code);
+            s_uw_in_handler = 2;
             g_ps3_guest_caller(s_flip_handler_opd, 1, 0, 0, 0, 0, 0, 0, 0);
+            s_uw_in_handler = 0;
         }
     }
-    if (user) {
+    if (gcm_user_cmd_queue_on()) {
+        /* One handler call per command, in FIFO order (see gcm_user_ring). */
+        unsigned drained = 0;
+        while (s_user_ring_tail != s_user_ring_head) {
+            u32 cmd = s_user_ring[s_user_ring_tail & (GCM_USER_RING - 1u)];
+            s_user_ring_tail++;
+            drained++;
+            s_uw_in_handler = 3;
+            if (s_user_handler_opd && g_ps3_guest_caller)
+                g_ps3_guest_caller(s_user_handler_opd, (uint64_t)cmd, 0, 0, 0, 0, 0, 0, 0);
+            s_uw_in_handler = 0;
+            s_uw_delivered++;
+        }
+        if (drained > 1) { static int n = 0; if (PS3_LOG_FIRST(n, 8))
+            fprintf(stderr, "[gcm] %u user commands were pending at one pump; each delivered\n", drained); }
+    } else if (user) {
         u32 cmd = (u32)user;
         if (s_user_handler_opd && g_ps3_guest_caller)
             g_ps3_guest_caller(s_user_handler_opd, (uint64_t)cmd, 0, 0, 0, 0, 0, 0, 0);
@@ -2806,6 +2889,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
                     u32 dea = gcm_io2ea(s_fifo_getoff + 4 + i * 4);
                     if (!dea) break;
                     u32 m = (type == 0) ? method + i * 4 : method;
+
                     u32 v = vm_read32(dea);
                     u32 la = GCM_LABEL_GUEST_BASE + (s_sema_offset & 0xFFFFu);
                     { static int sn = 0, recdbg = -1; if (recdbg < 0) recdbg = getenv("GCM_RECDBG") ? 1 : 0;
@@ -2926,6 +3010,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
                 /* Each data word is read once: the paths below all take it. */
                 const u32 dw = vm_read32(dea);
                 u32 m = (type == 0) ? method + i * 4 : method;
+
                 /* GCM_SET_USER_COMMAND is method 0xEB00, which this decode
                  * splits into subchannel 7 / method 0x0B00 -- so it was landing
                  * in the 2D engine path and being dropped as unrecognised. It
@@ -2943,9 +3028,8 @@ static void gcm_rsx_process_fifo_unlocked(void)
                  * current, GCM_FLIP_COMMAND, {id})). The flip happens here, when
                  * the RSX reaches it -- see GCM_PREPAREFLIP_FIFO. */
                 if (subch == 7 && m == 0x1EACu) {
-                    extern s32 gcm_flip_request_ext(u32 bufferId, int in_fifo);
                     const u32 id = dw & 0xFFu;
-                    gcm_flip_request_ext(id, 1);
+                    gcm_flip_request(id, 1);
                     gcm_set_current_display_buffer(id);
                     s_flip_pending = 1;
                     s_flip_request_count++;
@@ -4853,7 +4937,21 @@ void cellGcmSetUserCommand(u32 cmd)
  * Like the driver cause register, multiple pending commands coalesce. */
 void cellGcmQueueUserCommand(u32 cmd)
 {
+    gcm_user_watch_start();
+    s_uw_queued++;
     GCM_USER_STORE(cmd);
+    if (gcm_user_cmd_queue_on()) {
+        if ((u32)(s_user_ring_head - s_user_ring_tail) < GCM_USER_RING) {
+            s_user_ring[s_user_ring_head & (GCM_USER_RING - 1u)] = cmd;
+#ifdef _WIN32
+            MemoryBarrier();
+#else
+            atomic_thread_fence(memory_order_seq_cst);
+#endif
+            s_user_ring_head++;
+        } else { static int n = 0; if (PS3_LOG_FIRST(n, 4))
+            fprintf(stderr, "[gcm] user command ring full, 0x%08X dropped\n", cmd); }
+    }
     GCM_USER_PENDING_STORE((1ULL << 32) | cmd);
 #ifdef _WIN32
     gcm_pump_wake();

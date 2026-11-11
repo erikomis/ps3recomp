@@ -67,6 +67,20 @@ uint64_t spurs_pm_build_context(uint8_t* ls, uint32_t taskset_ea, uint32_t taskI
     LS_BE32(STC_TASK_ID,      taskId);
     LS_BE32(STC_TASKSET_MGMT_ADDR, STC_BASE);
     LS_BE64(STC_X2FC0, 0);
+    /* Task descriptor at LS 0x2FB0: the SPURS task library linked into task
+     * ELFs with the 0x3050/0x3070 CRTs (Asura's msngSPURS_MP3 audio/movie
+     * decoder, the fios IO workers, Edge/PhysX) reads word1 as a base and
+     * computes service calls at base+0xC4 and validation fields at base+0x98
+     * and base+0xA0. Point it at the STC: base+0xC4 selects the syscallAddr
+     * (0x27C4 = the HLE PM syscall trampoline), and base+0x98/+0xA0 land on
+     * the TaskInfo copy's context/ls_pattern fields the validator wants
+     * non-zero. Without this the library branches through a null table
+     * word and the task limps into BSS interpreted as code, never parks on
+     * WAIT_SIGNAL, and every _cellSpursSendSignal the game fires at it is
+     * dropped -- which is what froze Asura's movie decode task and, with it,
+     * the title-menu video. */
+    LS_BE32(0x2FB0, 0xFFFFFFFFu);
+    LS_BE32(0x2FB4, STC_BASE);
     /* Task-syscall path: a SPURS task reads syscallAddr from its context and branches to
      * it (e.g. to EXIT). The real kernel sets it to the PM's in-LS syscall entry (0xA70);
      * we don't have the PM resident, so we set the same address and INTERCEPT a branch to

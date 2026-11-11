@@ -4800,7 +4800,8 @@ def discover_jump_tables(all_insns, read_u32, toc, text_lo, text_hi, func_starts
                                 continue
                             if count is None or _c > count:
                                 count = _c
-            if count is None or count < 0 or count > 4096:
+            _count_unknown = count is None or count < 0 or count > 4096
+            if _count_unknown:
                 count = 256
             # The cmp-derived count is a HINT, never a hard cap. It keeps UNDER-
             # counting: the backward window spans sibling basic blocks, so it can
@@ -4840,7 +4841,20 @@ def discover_jump_tables(all_insns, read_u32, toc, text_lo, text_hi, func_starts
                 if table_base is None:
                     continue
                 targets = []
-                for k in range(scan):
+                # No bound found and the table sits in the text segment: it is
+                # an inline table, placed directly before its cases, and the
+                # structural end below (cursor reaches the lowest forward case)
+                # finds its exact length, so the 256 guess must not cut it.
+                # Unoptimised code reloads the index from the stack between the
+                # bounds check and the shift (`cmplwi r0,0x174` ... `lwz
+                # r0,0x34(r31)` / `sldi r9,r0,2`), which defeats the register
+                # match above. Asura's Wrath func_00CD65CC is such a switch,
+                # 373 entries at 0x00CD6624: cases 256+ became unresolved
+                # indirect calls and the first map load ran on with garbage.
+                _scan = scan
+                if _count_unknown and text_lo <= table_base < text_hi:
+                    _scan = 4096
+                for k in range(_scan):
                     ea = (table_base + k * 4) & 0xFFFFFFFF
                     # Structural end-of-table: a jump table never overlaps the code
                     # it dispatches to, so once the cursor reaches the lowest case

@@ -25,6 +25,7 @@
 #include <string.h>
 #include <time.h>
 #include "ps3emu/log_first.h"
+#include "rsx_blend_log.h"
 
 /* Guest memory and the RSX offset resolvers, declared the way every backend
  * that reads guest data declares them (rsx_vertex_fetch.h). */
@@ -440,6 +441,37 @@ void rsx_draw_engine_decode_render_state(const rsx_dispatch* rsx,
     rs->sf_rgb = sfac & 0xFFFF; rs->sf_a = sfac >> 16;
     rs->df_rgb = dfac & 0xFFFF; rs->df_a = dfac >> 16;
     rs->eq_rgb = eq & 0xFFFF;   rs->eq_a = eq >> 16;
+#if RSX_BLEND_LOG_AVAILABLE
+    /* RSX_BLEND_LOG: how often a draw's blend state uses CONSTANT_COLOR/ALPHA
+     * (factors 0x8001-0x8004), which the Metal backend maps to One. Counts calls
+     * to this decoder (a draw may be decoded more than once), not unique draws.
+     * Log-only; nothing below reads these counters. */
+    if (rsx_blend_log_on()) {
+        static unsigned long long s_all, s_blend, s_const; static int s_budget; static long long s_t;
+        const unsigned long long all = RSX_BLEND_LOG_ADD(&s_all, 1ull);
+        if (rs->blend_enable) RSX_BLEND_LOG_ADD(&s_blend, 1ull);
+        if (((rs->sf_rgb | rs->df_rgb | rs->sf_a | rs->df_a) & 0x8000u) && rs->blend_enable) {
+            const unsigned long long c = RSX_BLEND_LOG_ADD(&s_const, 1ull);
+            if (rsx_blend_log_budget(&s_budget, 40)) {
+                char line[200];
+                snprintf(line, sizeof line,
+                         "[blend] CONSTANT factor in use (decode #%llu): sf=0x%04X/0x%04X"
+                         " df=0x%04X/0x%04X eq=0x%04X/0x%04X rt_fp16=%d\n",
+                         c, rs->sf_rgb, rs->sf_a, rs->df_rgb, rs->df_a,
+                         rs->eq_rgb, rs->eq_a, (int)rs->rt_fp16);
+                fputs(line, stderr);
+            }
+        }
+        if ((all & 0xFFull) == 0 && rsx_blend_log_tick(&s_t, 5000)) {
+            char line[200];
+            snprintf(line, sizeof line,
+                     "[blend] decodes=%llu with_blend=%llu with_CONSTANT_factor=%llu\n",
+                     RSX_BLEND_LOG_LOAD(&s_all), RSX_BLEND_LOG_LOAD(&s_blend),
+                     RSX_BLEND_LOG_LOAD(&s_const));
+            fputs(line, stderr);
+        }
+    }
+#endif
     rs->depth_test  = rsx_dsp_reg(rsx, M_DEPTH_TEST_ENABLE) & 1;
     rs->depth_write = rsx_dsp_reg(rsx, M_DEPTH_WRITE) & 1;
     rs->depth_func  = rsx_dsp_reg(rsx, M_DEPTH_FUNC);
