@@ -40,8 +40,11 @@ extern "C" {
 #define CELL_VIDEO_OUT_ASPECT_4_3    1
 #define CELL_VIDEO_OUT_ASPECT_16_9   2
 
-/* Output type */
-#define CELL_VIDEO_OUT_OUTPUT_HDMI   5
+#define CELL_VIDEO_OUT_PORT_HDMI     0x01
+#define CELL_VIDEO_OUT_DEVICE_STATE_AVAILABLE  1
+#define CELL_VIDEO_OUT_DISPLAY_CONVERSION_NONE 0
+#define CELL_VIDEO_OUT_REFRESH_RATE_59_94HZ    0x0001
+#define CELL_VIDEO_OUT_REFRESH_RATE_60HZ       0x0004
 
 /* Color space */
 #define CELL_VIDEO_OUT_COLOR_SPACE_RGB   0x01
@@ -81,25 +84,6 @@ typedef struct CellVideoOutResolution {
     u16 height;
 } CellVideoOutResolution;
 
-typedef struct CellVideoOutDisplayModeBytes {
-    u8  resolutionId;
-    u8  scanMode;
-    u8  conversion;
-    u8  aspect;
-    u8  reserved[2];
-    u16 refreshRates;   /* big-endian in guest memory */
-} CellVideoOutDisplayModeBytes;
-
-typedef struct CellVideoOutState {
-    u8  state;          /* 0=disabled, 2=enabled */
-    u8  colorSpace;
-    u8  reserved[6];
-    /* SDK layout: an 8-byte CellVideoOutDisplayMode struct, NOT a u32 mode id.
-     * Guests read displayMode.aspect (byte 11) to pick 4:3 vs 16:9; the old
-     * u32 fed them a byte of a mode constant ("unknown aspect ratio 4"). */
-    CellVideoOutDisplayModeBytes displayMode;
-} CellVideoOutState;
-
 typedef struct CellVideoOutConfiguration {
     u8  resolutionId;
     u8  format;
@@ -117,6 +101,17 @@ typedef struct CellVideoOutDisplayMode {
     u16 refreshRates;
 } CellVideoOutDisplayMode;
 
+typedef struct CellVideoOutColorInfo {
+    u16 redX, redY, greenX, greenY, blueX, blueY, whiteX, whiteY;
+    u32 gamma;
+} CellVideoOutColorInfo;
+
+typedef struct CellVideoOutKSVList {
+    u8  ksv[32 * 5];
+    u8  reserved[4];
+    u32 count;
+} CellVideoOutKSVList;
+
 typedef struct CellVideoOutDeviceInfo {
     u8  portType;
     u8  colorSpace;
@@ -125,8 +120,13 @@ typedef struct CellVideoOutDeviceInfo {
     u8  state;
     u8  rgbOutputRange;
     u8  reserved[5];
+    CellVideoOutColorInfo colorInfo;
     CellVideoOutDisplayMode availableModes[32];
+    CellVideoOutKSVList ksvList;
 } CellVideoOutDeviceInfo;
+
+_Static_assert(sizeof(CellVideoOutColorInfo) == 20, "CellVideoOutColorInfo layout");
+_Static_assert(sizeof(CellVideoOutDeviceInfo) == 456, "CellVideoOutDeviceInfo layout");
 
 /* ---------------------------------------------------------------------------
  * Configuration

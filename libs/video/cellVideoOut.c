@@ -141,7 +141,7 @@ s32 cellVideoOutConfigure(u32 videoOut, CellVideoOutConfiguration* config,
     config = GUEST_PTR(config, CellVideoOutConfiguration*);
     s_resolution_id = config->resolutionId;
     s_color_format  = config->format;
-    s_aspect        = config->aspect;
+    s_aspect        = config->aspect != CELL_VIDEO_OUT_ASPECT_AUTO ? config->aspect : CELL_VIDEO_OUT_ASPECT_16_9;
 
     /* config is a guest BE struct: byte-swap multi-byte reads */
     if (ps3_bswap32(config->pitch) > 0) {
@@ -193,42 +193,17 @@ s32 cellVideoOutGetDeviceInfo(u32 videoOut, u32 deviceIndex,
 
     info = GUEST_PTR(info, CellVideoOutDeviceInfo*);
     memset(info, 0, sizeof(CellVideoOutDeviceInfo));
-
-    info->portType       = CELL_VIDEO_OUT_OUTPUT_HDMI;
-    info->colorSpace     = CELL_VIDEO_OUT_COLOR_SPACE_RGB;
-    info->latency        = 0;
-    info->state          = 2; /* connected */
+    info->portType = CELL_VIDEO_OUT_PORT_HDMI;
+    info->colorSpace = CELL_VIDEO_OUT_COLOR_SPACE_RGB;
+    info->latency = ps3_bswap16(1000);
+    info->availableModeCount = 1;
+    info->state = CELL_VIDEO_OUT_DEVICE_STATE_AVAILABLE;
     info->rgbOutputRange = 1;
-
-    /* Report supported modes */
-    int idx = 0;
-
-    /* 480p */
-    info->availableModes[idx].resolutionId = CELL_VIDEO_OUT_RESOLUTION_480;
-    info->availableModes[idx].scanMode     = CELL_VIDEO_OUT_SCAN_MODE_PROGRESSIVE;
-    info->availableModes[idx].aspect       = CELL_VIDEO_OUT_ASPECT_16_9;
-    idx++;
-
-    /* 576p */
-    info->availableModes[idx].resolutionId = CELL_VIDEO_OUT_RESOLUTION_576;
-    info->availableModes[idx].scanMode     = CELL_VIDEO_OUT_SCAN_MODE_PROGRESSIVE;
-    info->availableModes[idx].aspect       = CELL_VIDEO_OUT_ASPECT_16_9;
-    idx++;
-
-    /* 720p */
-    info->availableModes[idx].resolutionId = CELL_VIDEO_OUT_RESOLUTION_720;
-    info->availableModes[idx].scanMode     = CELL_VIDEO_OUT_SCAN_MODE_PROGRESSIVE;
-    info->availableModes[idx].aspect       = CELL_VIDEO_OUT_ASPECT_16_9;
-    idx++;
-
-    /* 1080p */
-    info->availableModes[idx].resolutionId = CELL_VIDEO_OUT_RESOLUTION_1080;
-    info->availableModes[idx].scanMode     = CELL_VIDEO_OUT_SCAN_MODE_PROGRESSIVE;
-    info->availableModes[idx].aspect       = CELL_VIDEO_OUT_ASPECT_16_9;
-    idx++;
-
-    info->availableModeCount = (u8)idx;
-
+    info->availableModes[0].resolutionId = s_resolution_id;
+    info->availableModes[0].scanMode = CELL_VIDEO_OUT_SCAN_MODE_PROGRESSIVE;
+    info->availableModes[0].conversion = CELL_VIDEO_OUT_DISPLAY_CONVERSION_NONE;
+    info->availableModes[0].aspect = s_aspect;
+    info->availableModes[0].refreshRates = ps3_bswap16(CELL_VIDEO_OUT_REFRESH_RATE_59_94HZ | CELL_VIDEO_OUT_REFRESH_RATE_60HZ);
     return CELL_OK;
 }
 
@@ -242,19 +217,13 @@ s32 cellVideoOutGetNumberOfDevice(u32 videoOut)
     return 0;
 }
 
-/* Is (resolutionId, aspect) available on this output? Return 1 (available) for
- * the primary output. A 0 here makes the game skip its display-buffer/tile
- * setup, leaving a null render object it later dereferences. */
 s32 cellVideoOutGetResolutionAvailability(u32 videoOut, u32 resolutionId,
                                           u32 aspect, u32 option)
 {
-    (void)aspect; (void)option;
-    /* Stereoscopic 3D and dual-view modes have ids from 0x80 up (0x81 is 720p
-     * frame packing). Reporting them available tells the title a 3D TV is
-     * attached: MLB The Show 16 then asks to switch to 3D and, on yes, renders
-     * every frame twice, stacked over-under. No host display here is one. */
-    const s32 avail = (videoOut == CELL_VIDEO_OUT_PRIMARY && resolutionId < 0x80) ? 1 : 0;
-    printf("[cellVideoOut] GetResolutionAvailability(out=%u, res=%u) -> %d\n",
-           videoOut, resolutionId, avail);
+    (void)option;
+    const s32 avail = videoOut == CELL_VIDEO_OUT_PRIMARY && resolutionId == s_resolution_id &&
+                      (aspect == CELL_VIDEO_OUT_ASPECT_AUTO || aspect == s_aspect);
+    printf("[cellVideoOut] GetResolutionAvailability(out=%u, res=%u, aspect=%u) -> %d\n",
+           videoOut, resolutionId, aspect, avail);
     return avail;
 }
