@@ -19,7 +19,7 @@ def sha256(buf):
     return hashlib.sha256(buf).hexdigest()
 
 
-def code_ranges(info):
+def code_ranges(info, blob=None):
     # The loader applies every PT_LOAD in header order, including zero filling.
     # Lifting a segment in isolation is unsafe if another load can replace its
     # bytes. Treat any overlapping memory layout as unsupported until generation
@@ -34,7 +34,11 @@ def code_ranges(info):
     segment = executable[0]
     start, end = segment['addr'], segment['addr'] + segment['filesz']
     sections = [s for s in info['sections'] if s['flags'] & 4 and s['size']]
-    ranges = sorted((s['addr'], s['addr'] + s['size']) for s in sections) or [(start, end)]
+    ranges = sorted((s['addr'], s['addr'] + s['size']) for s in sections)
+    if not ranges:
+        from find_spu_functions import infer_code_end
+        inferred = infer_code_end(blob) if blob is not None else 0
+        ranges = [(start, inferred if start < inferred <= end else end)]
     if any(a < start or b > end for a, b in ranges):
         raise ValueError('executable sections outside supported text segment')
     if any(b > c for (_, b), (c, _) in zip(ranges, ranges[1:])):
@@ -180,7 +184,7 @@ def build_programs(args, registry_writer):
             blob, info = blobs[digest], layouts[digest]
             (outdir / 'image.elf').write_bytes(blob)
             try:
-                ranges = code_ranges(info)
+                ranges = code_ranges(info, blob)
                 functions, (offset, base, size) = detect_functions(blob, verbose=False)
                 bounds = sorted({(max(s, a), min(e, b)) for s, e in functions for a, b in ranges
                                  if max(s, a) < min(e, b)})

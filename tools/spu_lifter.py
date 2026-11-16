@@ -1226,10 +1226,17 @@ def main() -> None:
     args = p.parse_args()
 
     if args.auto_functions:
-        from find_spu_functions import detect_functions, parse_elf, pick_text, text_image
+        from find_spu_functions import detect_functions, infer_code_end, parse_elf, pick_text, text_image
         with open(args.auto_functions, "rb") as f:
             elf_buf = f.read()
         funcs, (text_off, base, size) = detect_functions(elf_buf)
+        if not args.code_end:
+            inferred = infer_code_end(elf_buf)
+            if inferred:
+                args.code_end = inferred
+                sys.stderr.write("[spu_lifter] no executable sections: code ends at 0x%X, "
+                                 "the first undecodable word follows and nothing in the code "
+                                 "references past it\n" % inferred)
         data, _ = text_image(elf_buf, parse_elf(elf_buf)["phs"])
         if args.base != 0:
             base = args.base  # caller override

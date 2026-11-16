@@ -714,6 +714,37 @@ def detect_functions(buf, base_override=None, verbose=True, raw=False):
     return cleaned, (text_off, base, len(code))
 
 
+_TAIL_STOPS = {"bi", "br", "bra", "stop", "stopd"}
+
+
+def infer_code_end(buf):
+    elf = parse_elf(buf)
+    if any((sh["flags"] & SHF_EXECINSTR) and sh["size"] for sh in elf["shs"]):
+        return 0
+    code, base = text_image(buf, elf["phs"])
+    end = base + len(code)
+    insns = disassemble_spu(code, base_addr=base)
+    first = next((i.addr for i in insns if i.mnemonic == ".word"), None)
+    if first is None:
+        return 0
+    stops = [i.addr for i in insns if i.addr < first and i.mnemonic in _TAIL_STOPS]
+    if not stops:
+        return 0
+    ce = max(stops) + 4
+    below = [i for i in insns if i.addr < ce]
+    by_addr = {i.addr: i for i in insns}
+    refs = (collect_branch_targets(below)
+            | collect_link_register_targets(below)
+            | collect_computed_branch_targets(below)
+            | collect_jump_table_targets(below, code, base, end)
+            | collect_ila_continuation_targets(below, base, end)
+            | collect_duff_targets(below, base, end)
+            | collect_function_pointer_tables(buf, elf["phs"], base, end, by_addr))
+    if ce <= elf["entry"] < end or any(ce <= t < end for t in refs):
+        return 0
+    return ce
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
