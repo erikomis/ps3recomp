@@ -38,8 +38,17 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from elf_parser import ELFFile, PT_LOAD
 
 
+SHF_EXECINSTR = 0x4
+SHT_NOBITS = 8
+
+
 def code_ranges(elf):
-    """[(lo, hi)] of executable PT_LOAD segments (flag bit 0 = X)."""
+    secs = sorted((s.sh_addr, s.sh_addr + s.sh_size)
+                  for s in (getattr(elf, "section_headers", []) or [])
+                  if (s.sh_flags & SHF_EXECINSTR) and s.sh_size
+                  and s.sh_type != SHT_NOBITS)
+    if secs:
+        return secs
     rs = []
     for ph in elf.program_headers:
         if ph.p_type == PT_LOAD and (ph.p_flags & 0x1) and ph.p_filesz:
@@ -235,6 +244,7 @@ def main():
               "opd_base": hex(opd_va) if opd_va else None,
               "opd_size": hex(opd_size) if opd_size else None,
               "opd_count": len(opd_entries), "function_count": len(func_addrs),
+              "code_ranges": [[hex(lo), hex(hi)] for lo, hi in crange],
               "e_type": h.e_type, "load_segments": len(image)}
     with open(os.path.join(args.output, name + ".loader.json"), "w") as f:
         json.dump(loader, f, indent=1)
@@ -253,6 +263,7 @@ def main():
     print(f"OPD region       : {hex(opd_va) if opd_va else '?'} size {hex(opd_size) if opd_size else '?'}")
     print(f"OPD descriptors  : {len(opd_entries)}")
     print(f"unique functions : {len(func_addrs)}")
+    print(f"code ranges      : {', '.join(f'{lo:#x}-{hi:#x}' for lo, hi in crange)}")
     print(f"load segments    : {len(image)}")
     for seg in image:
         bss = int(seg['memsz'], 16) - int(seg['filesz'], 16)
