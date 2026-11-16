@@ -5564,6 +5564,8 @@ def main() -> None:
     if len(toc_candidates) == 1:
         lifter.toc_base = toc_candidates[0]
     lifter.code_hi = args.code_end
+    if lifter.code_hi is not None and func_bounds:
+        lifter.code_lo = min(s for s, _ in func_bounds)
     # Without --code-end, default the executable window to the function-bounds
     # span so branches into data still get clamped. With no window at all, a
     # garbage target decoded from data (e.g. dead bytes after a blrl reached by
