@@ -11,6 +11,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 from build_spu_workloads import debase_includes
 from spu_disasm import disassemble_spu
+from spu_elf import scan_spu_candidates
 
 EM_SPU = 23
 
@@ -97,17 +98,21 @@ def main():
     ap = argparse.ArgumentParser(
         description="Lift the SPU side of a relocated firmware module: its embedded SPU ELF "
                     "images, and the code bodies it streams into local store.")
-    ap.add_argument("--image", required=True, help="relocated module image (lift_prx.py <name>_image.bin)")
-    ap.add_argument("--base", required=True, type=lambda x: int(x, 0), help="guest EA the image is loaded at")
+    ap.add_argument("--image", help="relocated module image (lift_prx.py <name>_image.bin)")
+    ap.add_argument("--base", type=lambda x: int(x, 0), default=0, help="guest EA the image is loaded at")
     ap.add_argument("--name", required=True, help="symbol prefix stem, e.g. libsre")
     ap.add_argument("--first-image-id", type=int, default=100)
     ap.add_argument("--body", action="append", default=[],
                     help="OFF:SIZE:LSA:ENTRY:CODELEN (hex) of a code body in the image: lifted at LSA, "
                          "code bounded by CODELEN, registered as a code region at that address")
+    ap.add_argument("--pic", action="append", default=[],
+                    help="a position-independent firmware SPU ELF (dev_flash .pic plugin) that a title loads "
+                         "at a run-time LS address: lifted relocatable at its link address and registered "
+                         "by its code bytes")
     ap.add_argument("--out", required=True)
     a = ap.parse_args()
 
-    img = open(a.image, "rb").read()
+    img = open(a.image, "rb").read() if a.image else b""
     os.makedirs(a.out, exist_ok=True)
     py = sys.executable
     lifter = os.path.join(HERE, "spu_lifter.py")
@@ -133,7 +138,7 @@ def main():
         print("%s: SPU ELF at +0x%X (EA 0x%08X) entry 0x%X, %d functions, image %d, seeds %s, stack resets %s"
               % (name, off, a.base + off, entry, n, image_id, " ".join("0x%X" % x for x in seeds) or "-",
                  " ".join("0x%X" % x for x in resets) or "-"))
-        regs.append((name, image_id, None, resets))
+        regs.append((name, image_id, None, resets, None))
         sources.append(src)
         image_id += 1
 
@@ -157,21 +162,53 @@ def main():
         resets = sorted(set(sets) & lifted_entries(src))
         print("%s: body at +0x%X (EA 0x%08X) code 0x%X of 0x%X -> LS 0x%X, %d functions, image %d, stack resets %s"
               % (name, off, a.base + off, codelen, size, lsa, n, image_id, " ".join("0x%X" % x for x in resets) or "-"))
-        regs.append((name, image_id, (a.base + off, lsa, codelen), resets))
+        regs.append((name, image_id, (a.base + off, lsa, codelen), resets, None))
+        sources.append(src)
+        image_id += 1
+
+    for path in a.pic:
+        elf_bytes = open(path, "rb").read()
+        stem = re.sub(r"[^A-Za-z0-9_]", "_", os.path.splitext(os.path.basename(path))[0])
+        name = "%s_pic_%s" % (a.name, stem)
+        d = os.path.join(a.out, name)
+        os.makedirs(d, exist_ok=True)
+        elf = os.path.join(d, "image.elf")
+        open(elf, "wb").write(elf_bytes)
+        info = next((i for o, i, e in scan_spu_candidates(elf_bytes) if o == 0 and not e), None)
+        if not info or len(info["executable"]) != 1:
+            raise SystemExit("%s: not a single-code-segment SPU ELF" % path)
+        x = info["executable"][0]
+        text = [s["addr"] + s["size"] for s in info["sections"]
+                if s["flags"] & 4 and s["size"] and x["addr"] <= s["addr"] < x["addr"] + x["filesz"]]
+        code_end = max(text) if text else x["addr"] + x["filesz"]
+        code = elf_bytes[x["off"]:x["off"] + (code_end - x["addr"])]
+        src, n = lift([py, lifter, "--auto-functions", elf, "--reloc", "--symbol-prefix", name + "_",
+                       "--code-end", hex(code_end), "--merge-chunks", "-o", d], d)
+        print("%s: %s code 0x%X at link 0x%X, %d functions, image %d"
+              % (name, os.path.basename(path), len(code), x["addr"], n, image_id))
+        regs.append((name, image_id, None, [], (code, x["addr"])))
         sources.append(src)
         image_id += 1
 
     lines = ["#include <stdint.h>", "",
              "void spu_begin_image(int image_id);",
              "void spu_overlay_register_region_at(uint32_t content_ea, uint32_t lsa, uint32_t span, int image_id);",
+             "int spu_overlay_register_reloc_content(const uint8_t* code, uint32_t span, uint32_t canon, int image_id);",
              "void spu_register_stack_reset_entry(uint32_t entry, int image_id);"]
-    lines += ["void %s_spu_recomp_register(void);" % name for name, _, _, _ in regs]
+    lines += ["void %s_spu_recomp_register(void);" % name for name, _, _, _, _ in regs]
+    for name, _, _, _, content in regs:
+        if content:
+            lines += ["", "static const uint8_t %s_code[0x%X] = {" % (name, len(content[0]))]
+            lines += ["    " + "".join("0x%02X," % c for c in content[0][k:k + 24]) for k in range(0, len(content[0]), 24)]
+            lines += ["};"]
     lines += ["", "void %s_spu_register(void)" % a.name, "{"]
-    for name, iid, region, resets in regs:
+    for name, iid, region, resets, content in regs:
         lines.append("    spu_begin_image(%d);" % iid)
         lines.append("    %s_spu_recomp_register();" % name)
         if region:
             lines.append("    spu_overlay_register_region_at(0x%08Xu, 0x%Xu, 0x%Xu, %d);" % (region[0], region[1], region[2], iid))
+        if content:
+            lines.append("    spu_overlay_register_reloc_content(%s_code, 0x%Xu, 0x%Xu, %d);" % (name, len(content[0]), content[1], iid))
         for r in resets:
             lines.append("    spu_register_stack_reset_entry(0x%Xu, %d);" % (r, iid))
     lines += ["    spu_begin_image(0);", "}", ""]

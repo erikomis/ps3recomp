@@ -389,15 +389,18 @@ static int interp_stats_on(void)
     return s_is > 0;
 }
 
-static void interp_stats_bump(int* img, uint32_t* key, volatile long long* cnt, int image, uint32_t k)
+static uint8_t s_ie_sig[IS_N][32];
+
+static int interp_stats_bump(int* img, uint32_t* key, volatile long long* cnt, int image, uint32_t k)
 {
     int i;
     for (i = 0; i < IS_N && cnt[i]; i++)
         if (img[i] == image && key[i] == k) break;
-    if (i < IS_N) {
-        if (!cnt[i]) { img[i] = image; key[i] = k; }
-        cnt[i]++;
-    }
+    if (i >= IS_N) return -1;
+    const int fresh = !cnt[i];
+    if (fresh) { img[i] = image; key[i] = k; }
+    cnt[i]++;
+    return fresh ? i : -1;
 }
 
 static void interp_stats_top(const char* what, int* img, uint32_t* key, volatile long long* cnt, int n)
@@ -408,7 +411,12 @@ static void interp_stats_top(const char* what, int* img, uint32_t* key, volatile
         for (int j = 0; j < IS_N; j++)
             if (cnt[j] > 0 && (best < 0 || cnt[j] > cnt[best])) best = j;
         if (best < 0) break;
-        fprintf(stderr, "    img=0x%08X ls=0x%05X  %lld\n", (uint32_t)img[best], key[best], cnt[best]);
+        fprintf(stderr, "    img=0x%08X ls=0x%05X  %lld", (uint32_t)img[best], key[best], cnt[best]);
+        if (cnt == s_ie_cnt) {
+            fprintf(stderr, "  code");
+            for (int b = 0; b < 32; b++) fprintf(stderr, "%s%02X", (b & 3) ? "" : " ", s_ie_sig[best][b]);
+        }
+        fprintf(stderr, "\n");
         cnt[best] = -cnt[best];
     }
     for (int j = 0; j < IS_N; j++) cnt[j] = 0;
@@ -433,7 +441,7 @@ uint32_t spu_interp_run_until(spu_context* ctx, uint32_t start_lsa, uint32_t sto
         /* Credit an entry inside a resident code region to the image that
          * owns it, so the list names the lift that's missing the entry. */
         uint32_t pc = start_lsa & 0x3FFFC, key = pc; int owner = ctx->image_id;
-        for (unsigned s = 0; s < 4; ++s)
+        for (unsigned s = 0; s < SPU_RESIDENT_CODE_SLOTS; ++s)
             if (ctx->resident_code[s].image_id && pc >= ctx->resident_code[s].lsa &&
                 pc - ctx->resident_code[s].lsa < ctx->resident_code[s].size) {
                 owner = ctx->resident_code[s].image_id;
@@ -442,7 +450,9 @@ uint32_t spu_interp_run_until(spu_context* ctx, uint32_t start_lsa, uint32_t sto
                 key = ctx->resident_code[s].canon
                     ? pc - ctx->resident_code[s].lsa + ctx->resident_code[s].canon : pc;
             }
-        interp_stats_bump(s_ie_img, s_ie_pc, s_ie_cnt, owner, key);
+        const int fresh = interp_stats_bump(s_ie_img, s_ie_pc, s_ie_cnt, owner, key);
+        if (fresh >= 0 && pc + 32 <= SPU_LS_SIZE)
+            memcpy(s_ie_sig[fresh], ctx->ls + pc, 32);
     }
     ctx->pc = start_lsa & 0x3FFFC;
     ctx->status = SPU_STATUS_RUNNING;

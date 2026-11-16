@@ -33,3 +33,22 @@ function(ps3recomp_generate_spu output_dir)
     include("${output_dir}/sources.cmake")
     set(SPU_GENERATED_SOURCES "${SPU_GENERATED_SOURCES}" PARENT_SCOPE)
 endfunction()
+
+function(ps3recomp_generate_spu_jobs output_dir elf)
+    find_package(Python3 COMPONENTS Interpreter REQUIRED)
+    get_filename_component(elf "${elf}" ABSOLUTE BASE_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${elf}")
+    foreach(tool IN ITEMS lift_spurs_jobs.py lift_jobmods.py spu_lifter.py find_spu_functions.py
+                          spu_disasm.py spu_elf.py wrap_spu_elf.py build_spu_workloads.py)
+        set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${PS3RECOMP_DIR}/tools/${tool}")
+    endforeach()
+    file(REMOVE_RECURSE "${output_dir}")
+    execute_process(COMMAND "${Python3_EXECUTABLE}" "${PS3RECOMP_DIR}/tools/lift_spurs_jobs.py" "${elf}"
+                            --out "${output_dir}"
+                    RESULT_VARIABLE result OUTPUT_VARIABLE output ERROR_VARIABLE error)
+    if(NOT result EQUAL 0)
+        message(FATAL_ERROR "SPURS job generation failed.\n${output}\n${error}")
+    endif()
+    include("${output_dir}/sources.cmake")
+    set(SPU_JOB_SOURCES "${SPU_JOB_SOURCES}" PARENT_SCOPE)
+endfunction()

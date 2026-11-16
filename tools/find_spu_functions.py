@@ -722,6 +722,51 @@ def infer_code_end(buf):
     if any((sh["flags"] & SHF_EXECINSTR) and sh["size"] for sh in elf["shs"]):
         return 0
     code, base = text_image(buf, elf["phs"])
+    return _infer_code_end(code, base, elf["entry"], buf, elf["phs"])
+
+
+_FLOW_ENDS = {"bi", "br", "bra", "iret", "stopd"}
+_FLOW_HINTS = {"hbr", "hbra", "hbrr"}
+
+
+def reachable_code_end(code, base, entries):
+    insns = disassemble_spu(code, base_addr=base)
+    by_addr = {i.addr: i for i in insns}
+    end = base + len(code)
+    seen, undecodable = set(), set()
+    work = [e for e in entries if base <= e < end]
+    while work:
+        while work:
+            a = work.pop()
+            while base <= a < end and a not in seen:
+                ins = by_addr.get(a)
+                if ins is None:
+                    break
+                seen.add(a)
+                if ins.mnemonic == ".word":
+                    undecodable.add(a)
+                    break
+                m = ins.mnemonic
+                if m not in _FLOW_HINTS:
+                    work.extend(t for t in collect_branch_targets([ins]) if base <= t < end)
+                if m in _FLOW_ENDS or (m == "stop" and (ins.raw & 0x3FFF) == 0):
+                    break
+                a += 4
+        reached = [by_addr[a] for a in sorted(seen) if by_addr[a].mnemonic != ".word"]
+        more = (collect_link_register_targets(reached)
+                | collect_computed_branch_targets(reached)
+                | collect_jump_table_targets(reached, code, base, end)
+                | collect_ila_continuation_targets(reached, base, end))
+        work = [t for t in more if base <= t < end and t not in seen]
+    return (max(seen) + 4 if seen else base), sorted(undecodable)
+
+
+def infer_code_end_raw(code, base, entry):
+    phs = [dict(type=1, flags=5, off=0, vaddr=base, filesz=len(code))]
+    return _infer_code_end(code, base, entry, code, phs)
+
+
+def _infer_code_end(code, base, entry, buf, phs):
     end = base + len(code)
     insns = disassemble_spu(code, base_addr=base)
     first = next((i.addr for i in insns if i.mnemonic == ".word"), None)
@@ -739,8 +784,8 @@ def infer_code_end(buf):
             | collect_jump_table_targets(below, code, base, end)
             | collect_ila_continuation_targets(below, base, end)
             | collect_duff_targets(below, base, end)
-            | collect_function_pointer_tables(buf, elf["phs"], base, end, by_addr))
-    if ce <= elf["entry"] < end or any(ce <= t < end for t in refs):
+            | collect_function_pointer_tables(buf, phs, base, end, by_addr))
+    if ce <= entry < end or any(ce <= t < end for t in refs):
         return 0
     return ce
 

@@ -314,6 +314,7 @@ typedef struct spu_context {
     int resident_ovl;
     /* Independently streamed code buffers can coexist with the policy overlay.
      * Each mapping records which translated image owns that local-store span. */
+#define SPU_RESIDENT_CODE_SLOTS 16u
     struct {
         uint32_t lsa, size, source_ea;
         int image_id;
@@ -324,7 +325,7 @@ typedef struct spu_context {
          * (spu_overlay_register_region_reloc): its functions are registered at
          * canon + offset, wherever the title placed this copy. 0 = ordinary placed lift. */
         uint32_t canon;
-    } resident_code[4];
+    } resident_code[SPU_RESIDENT_CODE_SLOTS];
     /* Placement minus canonical base of the relocatable code running now (spu_lifter.py
      * --reloc): lifted relocatable code adds it to every address it derives from its own
      * pc. Set by the dispatcher on entry into such code; only that code reads it. */

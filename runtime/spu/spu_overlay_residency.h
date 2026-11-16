@@ -29,6 +29,9 @@ int spu_overlay_register_verified_region(uint32_t content_ea, uint32_t load_lsa,
     uint32_t span, int image_id, const spu_overlay_code_segment* code,
     unsigned count);
 
+int spu_overlay_register_reloc_content(const uint8_t* code, uint32_t span, uint32_t canon,
+    int image_id);
+
 void spu_overlay_register_region_at(uint32_t content_ea, uint32_t lsa, uint32_t span,
     int image_id);
 

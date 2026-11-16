@@ -19,6 +19,7 @@
 #include "spu_interp.h"    /* spu_lifted_fn / spu_lifted_lookup -- defined below */
 #include "ps3emu/ps3_ftrace.h"
 #include "spu_overlay_residency.h"
+#include "../ps3_log.h"
 #include <stdint.h>
 #include <stdatomic.h>
 #include <stdio.h>
@@ -1226,6 +1227,7 @@ static void spu_ch_wait(spu_context* ctx, uint32_t channel, const char* op)
     if (!yz_ch_block() || spu_ch_ready(ctx, channel)) return;
     const uint64_t ft_t0 = PS3_FT_ON() ? ps3_ft_now() : 0;
 
+    if (ps3_log_verbose())
     { static unsigned long bn = 0; unsigned long n = ++bn;
       if (n <= 50 || (n % 512) == 0)
         fprintf(stderr, "[ch-block] spu=%X pc=0x%05X op=%s ch=%u evstat=0x%X evmask=0x%X\n",
@@ -1247,7 +1249,7 @@ static void spu_ch_wait(spu_context* ctx, uint32_t channel, const char* op)
                                           (SRWLOCK*)&ctx->ch_wait_lock, 10, 0);
             ReleaseSRWLockExclusive((SRWLOCK*)&ctx->ch_wait_lock);
             unsigned long long waited = GetTickCount64() - start;
-            if (waited >= next_hb) {
+            if (waited >= next_hb && ps3_log_verbose()) {
                 fprintf(stderr, "[ch-wait] spu=%X pc=0x%05X ch=%u waited=%llums evstat=0x%X evmask=0x%X resv[valid=%d ea=0x%08X]\n",
                         ctx->spu_id, ctx->pc & SPU_LS_MASK, channel, waited,
                         ctx->event_status, ctx->event_mask,
@@ -1771,7 +1773,7 @@ static spu_lifted_fn spu_lifted_lookup_full(const spu_context* ctx, uint32_t lsa
      * resolution and the first two usually miss, which is exactly the case a
      * generation-keyed memo answers without walking the hash chain again. */
     if (!ctx) return (spu_lifted_fn)spu_lookup_memoized(lsa, 0);
-    for (unsigned slot = 0; slot < 4; ++slot)
+    for (unsigned slot = 0; slot < SPU_RESIDENT_CODE_SLOTS; ++slot)
         if (ctx->resident_code[slot].image_id &&
             lsa >= ctx->resident_code[slot].lsa &&
             lsa - ctx->resident_code[slot].lsa < ctx->resident_code[slot].size) {
@@ -2052,12 +2054,82 @@ static int spu_overlay_resident_verified(spu_context* ctx, unsigned slot)
     int* state = &ctx->resident_code[slot].verify_state;
     if (*state == SPU_OVERLAY_PENDING) {
         const spu_ovl_src* o = &s_ovl_src[ctx->resident_code[slot].source_index];
+        const uint32_t canon = ctx->resident_code[slot].canon;
         int match = 1;
-        for (unsigned i = 0; match && i < o->code_count; ++i)
-            match = !memcmp(ctx->ls + o->code[i].lsa, o->code[i].bytes, o->code[i].size);
+        for (unsigned i = 0; match && i < o->code_count; ++i) {
+            const uint32_t at = canon ? ctx->resident_code[slot].lsa + (o->code[i].lsa - canon) : o->code[i].lsa;
+            match = at <= SPU_LS_SIZE - o->code[i].size &&
+                    !memcmp(ctx->ls + at, o->code[i].bytes, o->code[i].size);
+        }
         *state = match ? SPU_OVERLAY_VERIFIED : SPU_OVERLAY_REJECTED;
     }
     return *state == SPU_OVERLAY_VERIFIED;
+}
+
+int spu_overlay_register_reloc_content(const uint8_t* code, uint32_t span, uint32_t canon, int image_id)
+{
+    if (!code || span < 16 || !canon || canon >= SPU_LS_SIZE || span > SPU_LS_SIZE - canon ||
+        image_id <= 0 || s_ovl_src_count >= SPU_OVL_SRC_MAX)
+        return 0;
+    spu_overlay_code_segment* copy = (spu_overlay_code_segment*)malloc(sizeof *copy + span);
+    if (!copy) return 0;
+    uint8_t* bytes = (uint8_t*)(copy + 1);
+    memcpy(bytes, code, span);
+    copy->lsa = canon; copy->size = span; copy->bytes = bytes;
+    spu_ovl_src* o = &s_ovl_src[s_ovl_src_count];
+    memset(o, 0, sizeof *o);
+    o->image_id = image_id;
+    memcpy(o->sig, code, 16);
+    o->has_sig = 1;
+    o->span = span;
+    o->canon = canon;
+    o->load_lsa = canon;
+    o->code = copy;
+    o->code_count = 1;
+    atomic_store_explicit(&s_ovl_has_sig, 1, memory_order_release);
+    __atomic_store_n(&s_ovl_src_count, s_ovl_src_count + 1, __ATOMIC_RELEASE);
+    return 1;
+}
+
+static int spu_overlay_resolve_reloc(spu_context* ctx, uint32_t pc)
+{
+    const int nsrc = __atomic_load_n(&s_ovl_src_count, __ATOMIC_ACQUIRE);
+    uint32_t max_span = 0;
+    for (int i = 0; i < nsrc; i++)
+        if (s_ovl_src[i].canon && s_ovl_src[i].code && s_ovl_src[i].span > max_span)
+            max_span = s_ovl_src[i].span;
+    if (!max_span) return 0;
+    const uint32_t lowest = pc >= max_span ? pc - max_span + 1 : 0;
+    for (uint32_t base = pc & ~15u; ; base -= 16) {
+        for (int i = 0; i < nsrc; i++) {
+            const spu_ovl_src* o = &s_ovl_src[i];
+            if (!o->canon || !o->code || pc - base >= o->span || base > SPU_LS_SIZE - o->span ||
+                memcmp(ctx->ls + base, o->sig, 16) ||
+                memcmp(ctx->ls + base, o->code[0].bytes, o->code[0].size))
+                continue;
+            int slot = -1;
+            for (unsigned s = 0; s < SPU_RESIDENT_CODE_SLOTS && slot < 0; ++s)
+                if (!ctx->resident_code[s].image_id ||
+                    ctx->resident_code[s].image_id == o->image_id ||
+                    ctx->resident_code[s].lsa == base)
+                    slot = (int)s;
+            if (slot < 0) {
+                fprintf(stderr, "[spu-ovl] no free resident code span for image %d\n", o->image_id);
+                return 0;
+            }
+            ctx->resident_code[slot].lsa = base;
+            ctx->resident_code[slot].size = o->span;
+            ctx->resident_code[slot].source_ea = 0;
+            ctx->resident_code[slot].image_id = o->image_id;
+            ctx->resident_code[slot].verify_state = SPU_OVERLAY_VERIFIED;
+            ctx->resident_code[slot].source_index = i;
+            ctx->resident_code[slot].canon = o->canon;
+            spu_dcache_residency_changed(ctx);
+            return 1;
+        }
+        if (base < 16 || base - 16 < lowest) break;
+    }
+    return 0;
 }
 
 /* Register one-way runtime entries that replace the guest call stack.
@@ -2238,8 +2310,21 @@ void spu_lockguard_check(spu_context* ctx, uint32_t ea, const uint8_t* src, uint
 void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint32_t size)
 {
     uint32_t lsa = (uint32_t)(ls - ctx->ls);
+    { static int s_on = -1; static uint32_t s_lo, s_hi;
+      if (s_on < 0) { const char* e = getenv("SPU_GET_LS");
+          s_on = e && sscanf(e, "%x:%x", &s_lo, &s_hi) == 2; }
+      if (s_on && lsa < s_hi && lsa + size > s_lo) {
+          static uint64_t s_seen[512]; static unsigned s_n;
+          const uint64_t k = ((uint64_t)ea << 32) | ((uint64_t)lsa << 14) | (size & 0x3FFF);
+          int seen = 0;
+          for (unsigned i = 0; i < s_n && !seen; i++) seen = s_seen[i] == k;
+          if (!seen && s_n < 512) {
+              s_seen[s_n++] = k;
+              fprintf(stderr, "[spu-get] img=%d pc=0x%05X ea=0x%08X -> LS 0x%05X size=0x%X first=%02X%02X%02X%02X\n",
+                      ctx->image_id, (unsigned)(ctx->pc & SPU_LS_MASK), ea, lsa, size, ls[0], ls[1], ls[2], ls[3]);
+          } } }
     spu_ovl_dump(ctx, ea, lsa, ls, size);
-    for (unsigned slot = 0; slot < 4; ++slot) {
+    for (unsigned slot = 0; slot < SPU_RESIDENT_CODE_SLOTS; ++slot) {
         if (!ctx->resident_code[slot].image_id) continue;
         uint32_t base = ctx->resident_code[slot].lsa;
         uint32_t end = base + ctx->resident_code[slot].size;
@@ -2272,7 +2357,7 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
         while (k < hi - lo && !q[k]) k++;
         if (k == hi - lo || memcmp(q, vm_base + s_ovl_at[i].ea + (lo - rlo), hi - lo)) continue;
         int have = 0, free_slot = -1;
-        for (unsigned slot = 0; slot < 4; ++slot) {
+        for (unsigned slot = 0; slot < SPU_RESIDENT_CODE_SLOTS; ++slot) {
             if (ctx->resident_code[slot].image_id == s_ovl_at[i].image_id &&
                 ctx->resident_code[slot].lsa == rlo) have = 1;
             if (free_slot < 0 && (!ctx->resident_code[slot].image_id || ctx->resident_code[slot].lsa == rlo))
@@ -2307,8 +2392,8 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
             if (o->span) {
                 if (lsa + o->span > SPU_LS_SIZE) return;
                 /* Verified code was lifted for one load address. */
-                if (o->code && lsa != o->load_lsa) continue;
-                for (unsigned slot = 0; slot < 4; ++slot) {
+                if (o->code && !o->canon && lsa != o->load_lsa) continue;
+                for (unsigned slot = 0; slot < SPU_RESIDENT_CODE_SLOTS; ++slot) {
                     /* A relocatable image takes over its own previous placement's slot: each load
                      * lands somewhere new, and stale copies would fill the slots. */
                     if (ctx->resident_code[slot].image_id && ctx->resident_code[slot].lsa != lsa &&
@@ -2999,6 +3084,8 @@ void spu_indirect_branch(spu_context* ctx)
     }
     /* Use the same ownership order as the interpreter's rejoin probe. */
     spu_fn fn = spu_lifted_lookup(ctx, ctx->pc);
+    if (!fn && spu_overlay_resolve_reloc(ctx, ctx->pc & SPU_LS_MASK))
+        fn = spu_lifted_lookup(ctx, ctx->pc);
     /* The job returned through the link register we planted: it is finished.
      * Its outermost frame ends in `bi $r0`, and r0 was 0 -- so without this the
      * return landed on LS 0, which is the job's OWN entry, and it ran a second
