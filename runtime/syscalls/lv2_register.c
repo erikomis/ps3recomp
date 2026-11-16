@@ -1695,6 +1695,21 @@ static int64_t sys_spu_thread_group_connect_event_all_threads_handler(ppu_contex
     return (int64_t)(int32_t)result;
 }
 
+static int64_t sys_spu_thread_group_disconnect_event_all_threads_handler(ppu_context* ctx)
+{
+    const uint32_t port = (uint32_t)ctx->gpr[4];
+    spu_group_t* g = port > 63u ? NULL : spu_find_group((uint32_t)ctx->gpr[3]);
+    uint32_t result = CELL_OK;
+    if (port > 63u) result = CELL_EINVAL;
+    else if (!g) result = CELL_ESRCH;
+    else {
+        AcquireSRWLockExclusive(&s_spu_port_lock);
+        g->user_event_ports[port] = 0;
+        ReleaseSRWLockExclusive(&s_spu_port_lock);
+    }
+    ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)result;
+    return (int64_t)(int32_t)result;
+}
 /* The interrupt mailbox encodes send_event (0..63) or throw_event (64..127).
  * The preceding ordinary mailbox word is data, not a separate PPU event. */
 static int spu_deliver_user_event(spu_context* spu, uint32_t value)
@@ -2645,6 +2660,7 @@ void lv2_register_all_syscalls(lv2_syscall_table* tbl)
     lv2_syscall_register(tbl, SYS_SPU_THREAD_BIND_QUEUE,      sys_spu_thread_stub);
     lv2_syscall_register(tbl, SYS_SPU_THREAD_UNBIND_QUEUE,    sys_spu_thread_stub);
     lv2_syscall_register(tbl, SYS_SPU_THREAD_GROUP_CONNECT_EVENT_ALL_THREADS, sys_spu_thread_group_connect_event_all_threads_handler);
+    lv2_syscall_register(tbl, SYS_SPU_THREAD_GROUP_DISCONNECT_EVENT_ALL_THREADS, sys_spu_thread_group_disconnect_event_all_threads_handler);
 }
 
 /* ---------------------------------------------------------------------------

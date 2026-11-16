@@ -3535,18 +3535,13 @@ extern "C" void lv2_syscall(ppu_context* ctx)
                 return;
             }
         }
-        static int logged = 0;
-        if (logged < 30) {
-            fprintf(stderr, "[ppu] lv2_syscall %llu (stub)\n", (unsigned long long)num);
-            logged++;
-        }
-        /* The UNIMPLEMENTED syscalls are the ones a trace is most wanted for, and
-         * they were the only ones it skipped: sc_trace ran on both handled paths
-         * but not here, so PS3_SCTRACE showed everything except the gaps. Snapshot
-         * the args before the return value overwrites r3. */
+        static std::atomic<uint32_t> reported[1024 / 32];
+        const unsigned slot = (unsigned)(num & 1023u);
+        if (!(reported[slot >> 5].fetch_or(1u << (slot & 31u), std::memory_order_relaxed) & (1u << (slot & 31u))))
+            fprintf(stderr, "[ppu] lv2_syscall %llu is not implemented (ENOSYS)\n", (unsigned long long)num);
         { uint64_t _a3 = ctx->gpr[3], _a4 = ctx->gpr[4],
                    _a5 = ctx->gpr[5], _a6 = ctx->gpr[6];
-          ctx->gpr[3] = 0;   /* CELL_OK */
+          ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x80010003;
           sc_trace(num, ctx, _a3, _a4, _a5, _a6);
           return; }
     }
