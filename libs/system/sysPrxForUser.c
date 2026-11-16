@@ -500,6 +500,40 @@ s32 sys_ppu_thread_once(u32 once_ctrl_ea, u32 init_opd)
     return CELL_OK;
 }
 
+static volatile u32 s_spu_printf_cb[4];
+
+static s32 spu_printf_callback(unsigned which, u32 arg)
+{
+    const u32 opd = s_spu_printf_cb[which];
+    if (!opd)
+        return (s32)CELL_ESTAT;
+    uint64_t r3 = 0;
+    if (!ppu_guest_call_ct_checked(vm_read32(opd), vm_read32(opd + 4), arg, 0, 0, 0, 0, 0, 0, 0, &r3))
+        return (s32)CELL_ESTAT;
+    return (s32)(u32)r3;
+}
+
+s32 _sys_spu_printf_initialize(u32 agcb, u32 dgcb, u32 atcb, u32 dtcb)
+{
+    s_spu_printf_cb[0] = agcb;
+    s_spu_printf_cb[1] = dgcb;
+    s_spu_printf_cb[2] = atcb;
+    s_spu_printf_cb[3] = dtcb;
+    return CELL_OK;
+}
+
+s32 _sys_spu_printf_finalize(void)
+{
+    for (unsigned i = 0; i < 4; i++)
+        s_spu_printf_cb[i] = 0;
+    return CELL_OK;
+}
+
+s32 _sys_spu_printf_attach_group(u32 group)   { return spu_printf_callback(0, group); }
+s32 _sys_spu_printf_detach_group(u32 group)   { return spu_printf_callback(1, group); }
+s32 _sys_spu_printf_attach_thread(u32 thread) { return spu_printf_callback(2, thread); }
+s32 _sys_spu_printf_detach_thread(u32 thread) { return spu_printf_callback(3, thread); }
+
 s32 sys_lwmutex_create(sys_lwmutex_t_hle* lwmutex, const sys_lwmutex_attribute_t* attr)
 {
     YZ_XLAT(lwmutex, sys_lwmutex_t_hle*);

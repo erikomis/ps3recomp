@@ -98,6 +98,12 @@ s32 sys_process_is_spu_lock_line_reservation_address(u32 addr, u64 flags);
  * -----------------------------------------------------------------------*/
 
 s32 _sys_printf(const char* fmt, ...);
+s32 _sys_spu_printf_initialize(u32 agcb, u32 dgcb, u32 atcb, u32 dtcb);
+s32 _sys_spu_printf_finalize(void);
+s32 _sys_spu_printf_attach_group(u32 group);
+s32 _sys_spu_printf_detach_group(u32 group);
+s32 _sys_spu_printf_attach_thread(u32 thread);
+s32 _sys_spu_printf_detach_thread(u32 thread);
 /* NID 0x9FB6228E -- the abort half of the SDK internal assertion macro. */
 s32 _sys_trap_process(const char* msg);
 s32 _sys_sprintf(char* buf, const char* fmt, ...);
