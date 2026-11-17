@@ -55,7 +55,8 @@ void spu_coh_reserve(spu_context* ctx, uint32_t ea);
  * lock, when ctx is already a registered holder and ea's line already marked.
  * Returns 0 when the caller must take the lock and call spu_coh_reserve
  * instead. On 1 the caller copies the line, also without the lock. */
-int spu_coh_reserve_fast(spu_context* ctx, uint32_t ea);
+int spu_coh_reserve_fast(spu_context* ctx, uint32_t ea, uint32_t* seq);
+int spu_lockline_unchanged(uint32_t seq);
 
 /* Is `addr`'s line marked? The PPU store fast path -- a range-free O(1) bitmap
  * lookup guarded by a global that is zero until the first GETLLAR. */
