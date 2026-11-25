@@ -84,6 +84,29 @@ typedef struct CellVideoOutResolution {
     u16 height;
 } CellVideoOutResolution;
 
+/* Kept from the pre-Vajra header: the fork's a5e0e21f removed these together
+ * with cellVideoOutGetState (deleted in their 61af6607 renderer rewrite, a
+ * commit not ported here). This tree still implements GetState and its
+ * registered NID, so the state structs stay. */
+typedef struct CellVideoOutDisplayModeBytes {
+    u8  resolutionId;
+    u8  scanMode;
+    u8  conversion;
+    u8  aspect;
+    u8  reserved[2];
+    u16 refreshRates;   /* big-endian in guest memory */
+} CellVideoOutDisplayModeBytes;
+
+typedef struct CellVideoOutState {
+    u8  state;          /* 0=disabled, 2=enabled */
+    u8  colorSpace;
+    u8  reserved[6];
+    /* SDK layout: an 8-byte CellVideoOutDisplayMode struct, NOT a u32 mode id.
+     * Guests read displayMode.aspect (byte 11) to pick 4:3 vs 16:9; the old
+     * u32 fed them a byte of a mode constant ("unknown aspect ratio 4"). */
+    CellVideoOutDisplayModeBytes displayMode;
+} CellVideoOutState;
+
 typedef struct CellVideoOutConfiguration {
     u8  resolutionId;
     u8  format;
