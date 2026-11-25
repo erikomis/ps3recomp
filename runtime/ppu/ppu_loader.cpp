@@ -3213,6 +3213,7 @@ extern "C" void ppu_unlifted_stub(uint64_t addr, ppu_context* ctx)
 /* The real lv2 syscall table (runtime/syscalls/lv2_register.c). */
 extern "C" int lv2_try_syscall(ppu_context* ctx);
 extern "C" int64_t sys_mmapper_allocate_address(ppu_context* ctx);
+extern "C" int64_t sys_memory_get_user_memory_size(ppu_context* ctx);
 extern "C" int64_t sys_mmapper_search_map_address(uint32_t start, uint32_t size, uint32_t* out);
 
 /* lv2 syscall dispatch: r11 = syscall number, args in r3.. (PPC ABI).
@@ -3310,12 +3311,8 @@ extern "C" void lv2_syscall(ppu_context* ctx)
         fprintf(stderr,"[sc-caller] port_send(port=1) from func_%08X+0x%llX data=0x%08X/0x%08X/0x%08X\n",
                 bg,(unsigned long long)(tgt-bh),(uint32_t)ctx->gpr[4],(uint32_t)ctx->gpr[5],(uint32_t)ctx->gpr[6]); } }
     switch (num) {
-    case 352: {   /* sys_memory_get_user_memory_size(sys_memory_info_t* info)
-                   * info = { u32 total_user_memory; u32 available_user_memory } */
-        uint32_t info = (uint32_t)ctx->gpr[3];
-        if (info) { vm_write32(info + 0, 0x10000000u);   /* 256 MB total */
-                    vm_write32(info + 4, 0x0C000000u); } /* 192 MB available */
-        ctx->gpr[3] = 0;
+    case 352: {
+        ctx->gpr[3] = (uint64_t)sys_memory_get_user_memory_size(ctx);
         return;
     }
     case 330: {   /* sys_mmapper_allocate_address(u64 size, u64 flags,

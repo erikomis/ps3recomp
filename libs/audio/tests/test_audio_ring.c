@@ -44,15 +44,15 @@ int main(void)
     s_audio_initialized = 1;
     vm_write64(0x100, 8);
     vm_write64(0x108, 32);
-    vm_write64(0x60000000, 0x123456789abcdef0ULL);
+    vm_write64(VM_AUDIO_BASE + VM_AUDIO_SIZE, 0x123456789abcdef0ULL);
     for (unsigned i = 0; i < CELL_AUDIO_PORT_MAX; ++i) {
         assert(cellAudioPortOpen((void*)0x100, (void*)0x200) == CELL_OK);
         assert(vm_read32(0x200) == i);
-        assert(s_ports[i].port_addr >= 0x58000000);
-        assert(s_ports[i].read_idx_addr + 8 <= 0x59000000);
+        assert(s_ports[i].port_addr >= VM_AUDIO_BASE);
+        assert(s_ports[i].read_idx_addr + 8 <= VM_AUDIO_BASE + VM_AUDIO_SIZE);
         if (i) assert(s_ports[i].port_addr > s_ports[i-1].read_idx_addr);
     }
-    assert(vm_read64(0x60000000) == 0x123456789abcdef0ULL);
+    assert(vm_read64(VM_AUDIO_BASE + VM_AUDIO_SIZE) == 0x123456789abcdef0ULL);
     u64 first = s_ports[0].port_addr;
     assert(cellAudioPortClose(0) == CELL_OK);
     assert(cellAudioPortOpen((void*)0x100, (void*)0x200) == CELL_OK);

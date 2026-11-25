@@ -153,7 +153,7 @@ Status of HLE (High-Level Emulation) implementations for PS3 system modules in p
 | Module | Category | Status | Notes |
 |---|---|---|---|
 | cellRtc | Real-Time Clock | **Complete** | Host time -> PS3 ticks, DateTime, time arithmetic, RFC formatting, day-of-week |
-| cellOvis | Overlay | **Complete** | Init/term, overlay create/destroy/invalidate (no-op stubs) |
+| cellOvis | SPU overlays | Partial | GetOverlayTableSize / InitializeOverlayTable for SPU ELFs without overlay segments (size 0); overlay tables not implemented |
 | cellSheap | Shared Heap | **Complete** | Bump allocator with block tracking, alloc/free/query, up to 8 heaps |
 | cellKey2char | Key to Char | **Complete** | HID scancode to Unicode, US-101 layout, shift/caps handling, dead key mode |
 | cellSubdisplay | Sub-display | **Complete** | PS Vita Remote Play stub — init/end/start/stop lifecycle, always reports not connected, touch data returns empty |

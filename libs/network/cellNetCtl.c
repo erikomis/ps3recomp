@@ -158,15 +158,9 @@ s32 cellNetCtlGetState(s32* state)
         return CELL_NET_CTL_ERROR_INVALID_ADDR;
 
     if (!netctl_online()) {
-        /* Offline: FAIL the query rather than report state=Disconnected.
-         * LBP's connect job (sub_F433C(0)) polls GetState forever until
-         * IPObtained and only exits on ret<0 -- and the working RPCS3 boot
-         * shows exactly one GetState call failing with NOT_INITIALIZED,
-         * after which the game proceeds offline. Still write a sane state
-         * for callers that ignore the return value. */
         vm_write32((uint32_t)(uintptr_t)state, CELL_NET_CTL_STATE_Disconnected);
-        printf("[cellNetCtl] GetState() -> error NOT_INITIALIZED (offline mode)\n");
-        return CELL_NET_CTL_ERROR_NOT_INITIALIZED;
+        printf("[cellNetCtl] GetState() -> Disconnected\n");
+        return CELL_OK;
     }
 
     vm_write32((uint32_t)(uintptr_t)state, CELL_NET_CTL_STATE_IPObtained);
@@ -184,6 +178,11 @@ s32 cellNetCtlGetInfo(s32 code, CellNetCtlInfo* info)
 
     info = GUEST_PTR(info, CellNetCtlInfo*);
     memset(info, 0, sizeof(CellNetCtlInfo));
+
+    if (!netctl_online() && code != CELL_NET_CTL_INFO_ETHER_ADDR) {
+        printf("[cellNetCtl] GetInfo(code=%d) -> NOT_CONNECTED (offline)\n", code);
+        return CELL_NET_CTL_ERROR_NOT_CONNECTED;
+    }
 
     switch (code)
     {

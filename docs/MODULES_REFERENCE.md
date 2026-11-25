@@ -1048,7 +1048,7 @@ Checks whether Remote Play streaming is available. Always reports unavailable in
 |--------|---------|----------------|
 | **cellScreenshot** | Screenshot capture | Enable/disable flag, parameter/overlay tracking |
 | **cellBGDL** | Background downloads | Init/term, download list always empty |
-| **cellOvis** | Overlay system | Init/term, create/destroy (no-op) |
+| **cellOvis** | SPU overlays | Overlay table size/initialisation; images without overlays only |
 | **cellSheap** | Shared heap allocator | Bump allocator with block tracking, up to 8 heaps |
 | **cellLicenseArea** | License region check | Americas default, all regions valid |
 | **cellMusicDecode/2** | Music decoding | Init/finish, decode returns NOT_SUPPORTED |
