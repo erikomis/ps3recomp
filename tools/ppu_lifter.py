@@ -126,8 +126,8 @@ void     vm_write64(uint64_t addr, uint64_t val);
  * loaded). Returns 1 if the reservation held (store applied), 0 otherwise. This
  * makes lock-free sequences (free-list CAS, refcounts) correct across host
  * threads -- a plain conditional write races and corrupts under real concurrency. */
-int      ppu_stwcx32(uint64_t addr, uint32_t expected, uint32_t val);
-int      ppu_stdcx64(uint64_t addr, uint64_t expected, uint64_t val);
+int      ppu_stwcx32(ppu_context* ctx, uint64_t addr, uint32_t expected, uint32_t val);
+int      ppu_stdcx64(ppu_context* ctx, uint64_t addr, uint64_t expected, uint64_t val);
 #ifdef __cplusplus
 }
 #endif
@@ -199,7 +199,7 @@ static inline ppu_mm ppu_mm_take(void)
     ppu_mm m;
     m.vb = vm_base;
     m.ld_span = vm_inline_ok ? span : 0;
-    m.st_span = (vm_inline_ok && vm_inline_st_ok) ? span : 0;
+    m.st_span = (vm_inline_ok && vm_inline_st_ok && !(g_barrier_sync_watch | g_null_sweep_hi)) ? span : 0;
     m.poll = ppu_hle_inject_base + 0x2008u;   /* the gcm ref-poll word: vm_read32 */
     return m;
 }
@@ -216,8 +216,7 @@ static inline int vm_mm_ok(const ppu_mm* m, uint32_t ea, uint32_t n)
 }
 static inline int vm_mm_st_ok(const ppu_mm* m, uint32_t ea, uint32_t n)
 {
-    if (!__builtin_expect(vm_mm_in(m->st_span, ea, n), 1) ||
-        __builtin_expect((g_barrier_sync_watch | g_null_sweep_hi) != 0, 0))
+    if (!__builtin_expect(vm_mm_in(m->st_span, ea, n), 1))
         return 0;
     const unsigned char* bits = g_spu_coh_bits;
     if (bits) { const uint32_t line = ea >> 7; if ((bits[line >> 3] >> (line & 7)) & 1u) return 0; }
@@ -999,7 +998,7 @@ def _last_line_is_terminator(body_lines: list[str]) -> bool:
 class PPULifter:
     """Translates PPU instructions into C source."""
 
-    def __init__(self, prefix: str = "", weak_emit: bool = False):
+    def __init__(self, prefix: str = "", weak_emit: bool = False, wrap: frozenset = frozenset()):
         self.functions: list[LiftedFunction] = []
         self.call_targets: set[int] = set()
         self.branch_targets: set[int] = set()  # all func_X references (b/bc trampolines)
@@ -1064,6 +1063,9 @@ class PPULifter:
             prefix += "_"
         self.prefix = prefix
         self.weak_emit = bool(weak_emit)
+        # --wrap: addresses whose lifted body is emitted as func_X_lifted so the
+        # port can define func_X itself (delegating to func_X_lifted as needed).
+        self.wrap = frozenset(wrap)
         # Cache for _range_insns: (instructions, len, ordered, addrs). Keyed by
         # the instruction-list identity so the FULL list (mid-function / serial
         # lift) is sorted+indexed once, not rescanned per call.
@@ -2732,7 +2734,7 @@ class PPULifter:
             # (lock-free free-list/refcount corruption under real host threads).
             return (f"{{ uint64_t ea = {ea}; "
                     f"int _sc = (ctx->reserve_addr == (uint32_t)ea) && "
-                    f"ppu_stwcx32(ea, (uint32_t)ctx->reserve_value, (uint32_t)ctx->gpr[{rs}]); "
+                    f"ppu_stwcx32(ctx, ea, (uint32_t)ctx->reserve_value, (uint32_t)ctx->gpr[{rs}]); "
                     f"ctx->cr = (ctx->cr & ~(0xFu << 28)) | (_sc ? (2u << 28) : 0u) | ((ctx->xer >> 31) << 28); "  # CR0 EQ = success
                     f"ctx->reserve_addr = 0; }}")
 
@@ -2748,7 +2750,7 @@ class PPULifter:
             ea = f"ctx->gpr[{ra}] + ctx->gpr[{rb}]" if ra != "0" else f"ctx->gpr[{rb}]"
             return (f"{{ uint64_t ea = {ea}; "
                     f"int _sc = (ctx->reserve_addr == (uint32_t)ea) && "
-                    f"ppu_stdcx64(ea, ctx->reserve_value, ctx->gpr[{rs}]); "
+                    f"ppu_stdcx64(ctx, ea, ctx->reserve_value, ctx->gpr[{rs}]); "
                     f"ctx->cr = (ctx->cr & ~(0xFu << 28)) | (_sc ? (2u << 28) : 0u) | ((ctx->xer >> 31) << 28); "
                     f"ctx->reserve_addr = 0; }}")
 
@@ -3996,6 +3998,8 @@ class PPULifter:
         # Forward declarations
         for func in self.functions:
             lines.append(f"void {func.name}(ppu_context* ctx);")
+            if func.start_addr in self.wrap:
+                lines.append(f"void {func.name}_lifted(ppu_context* ctx);")
         # Also declare any call targets that aren't defined
         defined = {f.start_addr for f in self.functions}
         for target in sorted((self.call_targets | self.branch_targets) - defined):
@@ -4176,7 +4180,8 @@ class PPULifter:
         for g in guards:
             lines += ["#ifdef __cplusplus", f'extern "C" int {g};', "#else",
                       f"extern int {g};", "#endif"]
-        lines.append(f"void {weak}{func.name}(ppu_context* ctx) {{")
+        name = f"{func.name}_lifted" if func.start_addr in self.wrap else func.name
+        lines.append(f"void {weak}{name}(ppu_context* ctx) {{")
         lines.append("    PPU_MM_SNAP")
         for bline in _fuse_cr(func.body_lines):
             lines.append(f"    {bline}" if not bline.endswith(":") else bline)
@@ -5062,6 +5067,8 @@ def main() -> None:
                         help="Prefix for every emitted func_*/function_table "
                              "symbol (e.g. 'libsre_') so a relocated PRX image "
                              "links alongside the main title without collisions")
+    parser.add_argument("--wrap", metavar="FILE", default=None,
+                        help="JSON list of function addresses whose lifted body is emitted as func_X_lifted; the port defines func_X")
     parser.add_argument("--weak", action="store_true",
                         help="Emit lifted function definitions as weak symbols "
                              "so a port's idiomatic overrides (strong symbols "
@@ -5553,7 +5560,8 @@ def main() -> None:
 
     print(f"Lifting {len(func_bounds)} functions...")
 
-    lifter = PPULifter(prefix=args.symbol_prefix, weak_emit=args.weak)
+    wrap = frozenset(int(a, 0) if isinstance(a, str) else int(a) for a in json.load(open(args.wrap))) if args.wrap else frozenset()
+    lifter = PPULifter(prefix=args.symbol_prefix, weak_emit=args.weak, wrap=wrap)
     lifter.header_name = args.header_name
     # A single-module executable keeps r2 (TOC) constant, so an `ld r2, N(r1)` TOC
     # restore can be lowered to this literal instead of a stack read (the recomp has
