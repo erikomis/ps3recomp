@@ -14,11 +14,11 @@
  * image-23 cri hack, lookup miss diagnostics) falls back to the full resolver.
  */
 #include "spu_context.h"
+#include "spu_interp.h"
 #include <stdio.h>
 #include <stdlib.h>
 
-typedef void (*spu_dispatch_fn)(spu_context*);
-spu_dispatch_fn spu_lookup(uint32_t addr, int image_id);  /* spu_channels.c (exported) */
+typedef spu_lifted_fn spu_dispatch_fn;
 void spu_indirect_branch(spu_context* ctx);               /* full resolver in the lib */
 
 void spu_indirect_branch_mt(spu_context* ctx)
@@ -55,11 +55,7 @@ void spu_indirect_branch_mt(spu_context* ctx)
                   || pc == SPURS_TASKSET_PM_SYSCALL_LS
                   || ctx->image_id == SPU_RESOLVER_ONLY_IMAGE_ID;
     if (!special) {
-        /* Resident overlay first (mirrors the full resolver): streamed plugin
-         * code owns its LS range; base-image entries at the same address are
-         * stale bytes and must lose. */
-        spu_dispatch_fn fn = ctx->resident_ovl ? spu_lookup(pc, ctx->resident_ovl) : 0;
-        if (!fn) fn = spu_lookup(pc, ctx->image_id);
+        spu_dispatch_fn fn = spu_lifted_lookup(ctx, pc);
         if (fn) {
             ctx->pc = pc;
             __attribute__((musttail)) return fn(ctx);

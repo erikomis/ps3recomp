@@ -48,6 +48,23 @@ def code_ranges(info, blob=None):
     return ranges
 
 
+def guest_ea(buf, offset):
+    if buf[:4] != b'\x7fELF' or buf[4] != 2 or buf[5] != 2:
+        return None
+    phoff = int.from_bytes(buf[0x20:0x28], 'big')
+    phnum = int.from_bytes(buf[0x38:0x3A], 'big')
+    for i in range(phnum):
+        p = phoff + 56 * i
+        if int.from_bytes(buf[p:p + 4], 'big') != 1:
+            continue
+        off = int.from_bytes(buf[p + 8:p + 16], 'big')
+        va = int.from_bytes(buf[p + 16:p + 24], 'big')
+        filesz = int.from_bytes(buf[p + 32:p + 40], 'big')
+        if off <= offset < off + filesz:
+            return va + (offset - off)
+    return None
+
+
 def publish(stage, destination):
     """Replace owned output as a unit, never reuse a previous generated lift."""
     backup = destination.with_name(destination.name + '.previous')
@@ -105,13 +122,17 @@ def build_programs(args, registry_writer):
             values = list(pinned_ids.values())
             if not all(type(v) is int and 0 < v < 0x80000000 for v in values) or len(set(values)) != len(values):
                 raise ValueError('--image-ids maps sha256 to distinct positive image ids')
+        return_entries = getattr(args, 'return_entries', False)
+        guest_regions = getattr(args, 'guest_regions', False)
         report['provenance'] = dict(tools={str(p): sha256(p.read_bytes()) for p in tool_paths},
                                     python=sys.version, options=dict(register_fn=args.register_fn, constructor=args.constructor,
                                                  extra_funcs=args.extra_funcs, allow_partial=args.allow_partial,
-                                                 handled=handled, image_ids=pinned_ids))
+                                                 handled=handled, image_ids=pinned_ids,
+                                                 return_entries=return_entries, guest_regions=guest_regions))
         unique = {}
         blobs = {}
         layouts = {}
+        eas = {}
         for path in inputs:
             try:
                 buf = Path(path).read_bytes()
@@ -126,6 +147,10 @@ def build_programs(args, registry_writer):
                     continue
                 blob = buf[offset:offset + info['size']]
                 digest = sha256(blob)
+                if guest_regions and digest not in eas:
+                    ea = guest_ea(buf, offset)
+                    if ea is not None:
+                        eas[digest] = ea
                 if digest in unique:
                     if blobs[digest] != blob:
                         raise ValueError('SHA256 collision between distinct images')
@@ -172,7 +197,7 @@ def build_programs(args, registry_writer):
             if not sep or name not in {p['name'] for p in unique.values()}:
                 raise ValueError('--extra-funcs requires discovered content name=ADDR[,ADDR...]')
             extra[name] = [int(s.strip(), 0) for s in value.split(',')]
-        imgs, text_fps, image_ids = [], {}, {}
+        imgs, text_fps, image_ids, regions = [], {}, {}, {}
         from find_spu_functions import detect_functions
         from build_spu_workloads import debase_includes
         for digest, program in sorted(unique.items()):
@@ -201,6 +226,8 @@ def build_programs(args, registry_writer):
                     command += ['--extra-funcs', ','.join(hex(a) for a in extra[name])]
                 if getattr(args, 'merge_chunks', False):
                     command += ['--merge-chunks']
+                if return_entries:
+                    command += ['--return-entries']
                 result = subprocess.run(command, capture_output=True, text=True)
                 (outdir / 'lift.log').write_text(result.stdout + result.stderr)
                 if result.returncode:
@@ -232,6 +259,15 @@ def build_programs(args, registry_writer):
             imgs.append((name, prefix, int(program['fingerprint'], 16), info['entry']))
             image_ids[name] = program['image_id']
             text_fps[name] = int(program['text_fingerprint'], 16)
+            if guest_regions:
+                if digest not in eas:
+                    report['errors'].append(name + ': --guest-regions found no guest EA for the program')
+                else:
+                    seg = info['executable'][0]
+                    lo = min(a for a, _ in program['executable_ranges'])
+                    hi = max(b for _, b in program['executable_ranges'])
+                    regions[name] = [(eas[digest] + seg['off'] + (lo - seg['addr']), lo, hi - lo)]
+                    program['guest_ea'] = hex(eas[digest])
         # Default runtime capacity is 256 registrations, including text aliases.
         if sum(len({fp, text_fps[name]}) for name, _, fp, _ in imgs) > 256:
             report['errors'].append('generated registrations exceed default runtime capacity (256)')
@@ -244,7 +280,7 @@ def build_programs(args, registry_writer):
         if usable:
             registry_args = type('RegistryArgs', (), dict(out=str(stage / registry.name), title='discovered SPU programs',
                                                         register_fn=args.register_fn, constructor=args.constructor))()
-            registry_writer(registry_args, imgs, text_fps, image_ids)
+            registry_writer(registry_args, imgs, text_fps, image_ids, regions)
             sources = [destination / name / 'spu_recomp.c' for name, _, _, _ in imgs] + [registry]
             # Bracket arguments preserve spaces and avoid expansion of $ in paths.
             cmake = 'set(SPU_GENERATED_SOURCES\n' + ''.join(f'  [==[{p.as_posix()}]==]\n' for p in sources) + ')\n'

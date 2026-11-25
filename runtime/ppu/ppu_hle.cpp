@@ -664,21 +664,7 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
             uint32_t _cap_ts = (nid==0x87630976u) ? (uint32_t)ctx->gpr[4] : 0; /* taskset EA before the call clobbers r4 */
             ctx->gpr[2] = toc;            /* libsre's own TOC */
             ctx->ctr    = code;
-            /* FLOW_REENTRY_ISO: the libsre fn re-enters lifted guest code at the PPU
-             * caller's r1; if it (or a frameless mid-entry inside it) runs at an
-             * overlapping frame, its stores clobber the caller's live frame (the
-             * deserializer this-ptr corruption). Drop r1 to a fresh guard slice so the
-             * re-entered frame can never overlap the caller. Args are in regs (ABI);
-             * results go via r3 / guest pointers, so isolating the frame is safe. */
-            /* Default ON: without isolation the libsre fn runs at the caller's r1 and
-             * its prologue `std r2,40(r1)` clobbers the caller's reserved TOC slot at
-             * 0x28(r1) -> caller reloads r2=0 -> null TOC -> func_002B03AC spin -> no
-             * draws. Isolating r1 to a fresh slice keeps the caller frame intact.
-             * Opt out with YDKJ_NO_REENTRY_ISO=1. */
-            { static int _ri=-1; if(_ri<0){ const char* e=getenv("YDKJ_NO_REENTRY_ISO"); _ri = (e && e[0]=='1') ? 0 : 1; }
-              if(_ri){ uint64_t _sr1=ctx->gpr[1]; ctx->gpr[1]=(ctx->gpr[1]-0x1000)&~0xFull;
-                ps3_indirect_call(ctx); ctx->gpr[1]=_sr1; }
-              else ps3_indirect_call(ctx); }       /* -> registered lifted libsre fn; r3=ret */
+            ps3_indirect_call(ctx);
             /* A real PRX serving this import is a different implementation of it,
              * so it gets its own prefix rather than reading as the HLE stub. */
             ps3_msf("prx:0x%08X", nid);
