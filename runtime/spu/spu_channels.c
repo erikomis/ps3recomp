@@ -664,7 +664,7 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
                     cmd, ea, (uint32_t)ctx->pc & SPU_LS_MASK, ctx->image_id);
         if (cmd == MFC_GETLLAR_CMD) {
             memset(ls, 0, MFC_ATOMIC_LINE);
-            ctx->resv_ea = ea; ctx->resv_valid = 0; ctx->atomic_stat = 4;
+            ctx->resv = (ea & ~127u); ctx->atomic_stat = 4;
         } else {
             ctx->atomic_stat = 1;   /* PUTLLC failure (line "moved") */
         }
@@ -763,7 +763,7 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
         /* MFC_RdAtomicStat after a GETLLAR reads 4 (GETLLAR complete), not 0:
          * Havok's SPU allocator (GH3 collide task, LS 0xA66C) re-issues the
          * GETLLAR until that bit is set, and spun forever on 0. PUTLLUC is 2. */
-        if (!llar_fast) { ctx->resv_ea = ea; ctx->resv_valid = 1; }   /* the fast path published it already */
+        if (!llar_fast) __atomic_store_n(&ctx->resv, (ea & ~127u) | 1u, __ATOMIC_RELAXED);   /* the fast path published it already */
         ctx->atomic_stat = 4;
         ctx->dbg_getllar++;
         /* A GETLLAR re-issued millions of times on one line is an SPU spin-wait
@@ -843,7 +843,7 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
           uint32_t b = g_barrier_sync_watch;
           if (b && (ea & ~127u) == (b & ~127u)) g_spu_putllc_sync_hit++; }
         spu_lockline_lock();
-        if (ctx->resv_valid && ctx->resv_ea == ea &&
+        if (__atomic_load_n(&ctx->resv, __ATOMIC_RELAXED) == ((ea & ~127u) | 1u) &&
             memcmp(mem, ctx->resv_line, MFC_ATOMIC_LINE) == 0) {
             { extern void spu_lockguard_check(spu_context*, uint32_t, const uint8_t*, uint32_t, const char*);
               spu_lockguard_check(ctx, ea, ls, MFC_ATOMIC_LINE, "PUTLLC"); }
@@ -860,7 +860,7 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
              * raise a self-LR: hardware CONSUMES the reservation on a
              * successful PUTLLC, it does not report it lost. Already under the
              * lock-line lock, which is what spu_coh_notify_write expects. */
-            ctx->resv_valid = 0;
+            __atomic_store_n(&ctx->resv, 0u, __ATOMIC_RELAXED);
             { static int s_w = -1;
               if (s_w < 0) s_w = getenv("SPU_PUTLLC_WHY") ? 1 : 0;
               if (s_w) { static unsigned long long n;
@@ -891,17 +891,18 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
               if (s_w < 0) s_w = getenv("SPU_PUTLLC_WHY") ? 1 : 0;
               if (s_w) {
                   static unsigned long long n_noresv, n_ea, n_line;
-                  if (!ctx->resv_valid)            n_noresv++;
-                  else if (ctx->resv_ea != ea)     n_ea++;
-                  else                             n_line++;
+                  const uint32_t _r = __atomic_load_n(&ctx->resv, __ATOMIC_RELAXED);
+                  if (!(_r & 1u))                 n_noresv++;
+                  else if ((_r & ~127u) != ea)   n_ea++;
+                  else                            n_line++;
                   static unsigned long long total;
                   if ((++total % 500000) == 0) {
                       fprintf(stderr, "[putllc-why] %llu fails: no-reservation=%llu"
                                       " ea-mismatch=%llu line-changed=%llu"
-                                      " (last ea=0x%08X img=%d resv_ea=0x%08X"
+                                      " (last ea=0x%08X img=%d resv=0x%08X"
                                       " getllar=%llu)\n",
                               total, n_noresv, n_ea, n_line, ea, ctx->image_id,
-                              ctx->resv_ea, (unsigned long long)ctx->dbg_getllar);
+                              _r, (unsigned long long)ctx->dbg_getllar);
                       fflush(stderr);
                   }
               } }
@@ -931,7 +932,7 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
               fprintf(stderr, "[atom-ea] PUTLLC %s lr=0x%05X ea=0x%08X\n",
                       ctx->atomic_stat ? "FAIL" : "OK",
                       ctx->gpr[0]._u32[0] & SPU_LS_MASK, ea); }
-        ctx->resv_valid = 0;                           /* reservation consumed */
+        __atomic_store_n(&ctx->resv, 0u, __ATOMIC_RELAXED);   /* reservation consumed */
         spu_lockline_unlock();
         if (ctx->atomic_stat == 0) {
             spu_taskset_line_committed(ea & ~127u);
@@ -951,7 +952,7 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
          * reservation here would commit a PUTLLC against a snapshot this store
          * has already overwritten. */
         spu_coh_notify_write(ea);
-        ctx->resv_valid = 0; ctx->atomic_stat = 2;   /* PUTLLUC complete */
+        __atomic_store_n(&ctx->resv, 0u, __ATOMIC_RELAXED); ctx->atomic_stat = 2;   /* PUTLLUC complete */
         spu_lockline_unlock();
         spu_taskset_line_committed(ea & ~127u);
         if (g_spu_line_commit_hook) g_spu_line_commit_hook(ea & ~127u);
@@ -1149,12 +1150,12 @@ static int yz_ch_block(void)
  */
 static void spu_resv_lost_poll(spu_context* ctx)
 {
-    if (!(ctx->event_mask & 0x400u) || !ctx->resv_valid) return;
-    if (!vm_base || ctx->resv_ea == 0) return;
-    if (memcmp(vm_base + ctx->resv_ea, ctx->resv_line, 128) != 0) {
-        ctx->resv_valid = 0;
+    uint32_t r = __atomic_load_n(&ctx->resv, __ATOMIC_RELAXED);
+    if (!(ctx->event_mask & 0x400u) || !(r & 1u)) return;
+    if (!vm_base || !(r & ~127u)) return;
+    if (memcmp(vm_base + (r & ~127u), ctx->resv_line, 128) != 0 &&
+        __atomic_compare_exchange_n(&ctx->resv, &r, r & ~1u, 0, __ATOMIC_SEQ_CST, __ATOMIC_RELAXED))
         SPU_EVENT_SET(ctx, 0x400u);
-    }
 }
 
 static int spu_ch_ready(spu_context* ctx, uint32_t channel)
@@ -1237,10 +1238,10 @@ static void spu_ch_wait(spu_context* ctx, uint32_t channel, const char* op)
             ReleaseSRWLockExclusive((SRWLOCK*)&ctx->ch_wait_lock);
             unsigned long long waited = GetTickCount64() - start;
             if (waited >= next_hb && ps3_log_verbose()) {
-                fprintf(stderr, "[ch-wait] spu=%X pc=0x%05X ch=%u waited=%llums evstat=0x%X evmask=0x%X resv[valid=%d ea=0x%08X]\n",
+                fprintf(stderr, "[ch-wait] spu=%X pc=0x%05X ch=%u waited=%llums evstat=0x%X evmask=0x%X resv=0x%08X\n",
                         ctx->spu_id, ctx->pc & SPU_LS_MASK, channel, waited,
                         ctx->event_status, ctx->event_mask,
-                        ctx->resv_valid, ctx->resv_ea);
+                        __atomic_load_n(&ctx->resv, __ATOMIC_RELAXED));
                 fflush(stderr);
                 next_hb = ((waited / 2000) + 1) * 2000;
             }
@@ -1380,12 +1381,14 @@ uint32_t spu_rchcnt(spu_context* ctx, uint32_t channel)
           lastsig[sp][0] = ctx->ch_sig_notify[0].count;
           lastsig[sp][1] = ctx->ch_sig_notify[1].count;
           lastmb[sp] = ctx->ch_in_mbox.count;
-          lastrv[sp] = ctx->resv_valid; lastrea[sp] = ctx->resv_ea;
+          { const uint32_t _rv = __atomic_load_n(&ctx->resv, __ATOMIC_RELAXED);
+            lastrv[sp] = (int)(_rv & 1u); lastrea[sp] = _rv & ~127u; }
           lastlsa[sp] = ctx->mfc_lsa & SPU_LS_MASK;
           lastr90[sp] = ctx->gpr[90]._u32[0];
-          lastrd[sp] = (ctx->resv_valid && vm_base && ctx->resv_ea)
-                     ? (memcmp(vm_base + ctx->resv_ea, ctx->resv_line, 128) != 0)
-                     : -1;
+          { const uint32_t _rd = __atomic_load_n(&ctx->resv, __ATOMIC_RELAXED);
+            lastrd[sp] = (_rd & 1u && vm_base && (_rd & ~127u))
+                     ? (memcmp(vm_base + (_rd & ~127u), ctx->resv_line, 128) != 0)
+                     : -1; }
           { static int s_ld2 = -2; static uint32_t s_lo2;
             if (s_ld2 == -2) { const char* e5 = getenv("SPU_LSDUMP");
                                s_ld2 = e5 ? 1 : 0;
@@ -1416,7 +1419,7 @@ uint32_t spu_rchcnt(spu_context* ctx, uint32_t channel)
                           lastst[q], lastmask[q], lastsig[q][0], lastsig[q][1],
                           lastmb[q]);
                   /* The reservation is the other half of an evmask=0x400 wait:
-                   * spu_resv_lost_poll returns immediately unless resv_valid,
+                   * spu_resv_lost_poll returns immediately unless a reservation is live,
                    * so a cleared reservation is indistinguishable from "nobody
                    * wrote the line" in event_status alone -- and they are
                    * different bugs. diff says whether the line has actually

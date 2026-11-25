@@ -186,14 +186,14 @@ static unsigned char s_coh_bitmap[SPU_COH_BITMAP_SZ];
  *
  * A contiguous array, not a linked list: every notifier walks all of it with
  * the line held, and a list's scattered nodes were a cache miss per holder on
- * top of the one on each holder's resv_valid, which the walk now prefetches a
+ * top of the one on each holder's resv, which the walk now prefetches a
  * few entries ahead. */
 static spu_context** s_coh_ctxs;
 static unsigned s_coh_n, s_coh_cap;
 #define SPU_COH_PREFETCH 4
 static inline void spu_coh_prefetch_holder(unsigned i)
 {
-    if (i < s_coh_n) __builtin_prefetch(&s_coh_ctxs[i]->resv_valid);
+    if (i < s_coh_n) __builtin_prefetch(&s_coh_ctxs[i]->resv);
 }
 static spu_coh_watch* s_coh_watches;
 
@@ -265,7 +265,7 @@ static void spu_coh_wake_watches(uint32_t line)
  * TRANSIENT: spu_run_lifted_job_abi runs each job on a STACK-LOCAL
  * spu_context, which registered itself here on its first reservation and then
  * returned. The entry outlived the object, so spu_coh_notify_write walked a
- * dangling pointer -- reading resv_valid, writing event_status and calling
+ * dangling pointer -- reading resv, writing event_status and calling
  * spu_ch_wake on reclaimed stack. Undefined behaviour, and observable: Guitar
  * Hero III showed THREE live-looking contexts for one dispatch, stealing each
  * other`s reservations, with every PUTLLC failing "no reservation". */
@@ -350,17 +350,17 @@ __attribute__((weak)) void ppu_resv_break_line(uint32_t ea) { (void)ea; }
  * nothing the reservation itself does not:
  *
  *   reader (spu_coh_reserve_fast + caller)    writer (any notifier caller)
- *     resv_valid = 0, resv_ea = ea,             store the new line data
- *     resv_valid = 1                            spu_coh_writer_fence()
- *     seq_cst fence                             load resv_valid / resv_ea
- *     copy the line                             if they cover the line:
- *                                                 LR, resv_valid = 0
+ *     resv = line | 1                           store the new line data
+ *     seq_cst fence                             spu_coh_writer_fence()
+ *     copy the line                             load resv
+ *                                               if it is line | 1:
+ *                                                 CAS it to line, then LR
  *
  * This is the store-buffering (Dekker) shape: with a seq_cst fence between the
  * store and the load on both sides, the two fences are ordered, so at least
  * one side sees the other. Either the reader's copy already holds the write
  * (an ordinary GETLLAR after the store), or the writer sees the reservation
- * and ends it. A writer that loads stale resv_valid/resv_ea is one whose fence
+ * and ends it. A writer that loads a stale resv is one whose fence
  * came first, so the copy already holds its data; at worst it ends the new
  * reservation spuriously.
  *
@@ -373,17 +373,13 @@ __attribute__((weak)) void ppu_resv_break_line(uint32_t ea) { (void)ea; }
  * Anything else takes the lock and spu_coh_reserve as before.
  *
  * Writers still hold the lock-line lock, so they stay serialized with each
- * other and with PUTLLC's compare-and-commit. resv_valid and resv_ea are accessed atomically on both sides of
- * the race; everything else about a reservation is still only touched by the
- * owning thread or under the lock.
+ * other and with PUTLLC's compare-and-commit. resv is one word, so the writer's
+ * compare-and-swap ends exactly the reservation it saw: one the owner has since
+ * moved to another line is left alone and gets no event. Everything else about a
+ * reservation is still only touched by the owning thread or under the lock.
  * ===========================================================================*/
 static inline void spu_coh_writer_fence(void) { __atomic_thread_fence(__ATOMIC_SEQ_CST); }
 
-static inline int spu_coh_holds(const spu_context* c, uint32_t line)
-{
-    return __atomic_load_n(&c->resv_valid, __ATOMIC_RELAXED) &&
-           (__atomic_load_n(&c->resv_ea, __ATOMIC_RELAXED) & ~127u) == line;
-}
 
 int spu_coh_reserve_fast(spu_context* ctx, uint32_t ea, uint32_t* seq)
 {
@@ -391,10 +387,8 @@ int spu_coh_reserve_fast(spu_context* ctx, uint32_t ea, uint32_t* seq)
         !spu_coh_is_reserved(ea))
         return 0;
     /* Retire any older reservation before retargeting it. The fence is what
-     * the argument above rests on. */
-    __atomic_store_n(&ctx->resv_valid, 0, __ATOMIC_RELAXED);
-    __atomic_store_n(&ctx->resv_ea, ea, __ATOMIC_RELAXED);
-    __atomic_store_n(&ctx->resv_valid, 1, __ATOMIC_RELAXED);
+     * the argument above rests on. Single word: EA|1 while live. */
+    __atomic_store_n(&ctx->resv, (ea & ~127u) | 1u, __ATOMIC_RELAXED);
     __atomic_thread_fence(__ATOMIC_SEQ_CST);
     *seq = __atomic_load_n(&g_lockline_seq, __ATOMIC_ACQUIRE);
     return !(*seq & 1u);
@@ -411,9 +405,9 @@ void spu_coh_notify_write_except(uint32_t ea, const void* self)
         spu_coh_prefetch_holder(i + SPU_COH_PREFETCH);
         spu_context* c = s_coh_ctxs[i];
         if (!c || (const void*)c == self) continue;
-        if (spu_coh_holds(c, line)) {
+        uint32_t r = line | 1u;
+        if (__atomic_compare_exchange_n(&c->resv, &r, line, 0, __ATOMIC_SEQ_CST, __ATOMIC_RELAXED)) {
             SPU_EVENT_SET(c, SPU_EVENT_LR);
-            __atomic_store_n(&c->resv_valid, 0, __ATOMIC_RELAXED);
             g_spu_lr_raise++;
             spu_ch_wake(c);
         }
@@ -431,9 +425,11 @@ void spu_coh_notify_write(uint32_t ea)
         spu_coh_prefetch_holder(i + SPU_COH_PREFETCH);
         spu_context* c = s_coh_ctxs[i];
         if (!c) continue;
-        if (spu_coh_holds(c, line)) {
-            SPU_EVENT_SET(c, SPU_EVENT_LR);
-            __atomic_store_n(&c->resv_valid, 0, __ATOMIC_RELAXED);   /* reservation lost, PUTLLC must fail */
+        /* End only the reservation this writer observed (CAS line|1 -> line);
+         * a stale read must never cancel a newer reservation on another line. */
+        uint32_t r = line | 1u;
+        if (__atomic_compare_exchange_n(&c->resv, &r, line, 0, __ATOMIC_SEQ_CST, __ATOMIC_RELAXED)) {
+            SPU_EVENT_SET(c, SPU_EVENT_LR);   /* reservation lost, PUTLLC must fail */
             /* SPU_PUTLLC_WHY=1: name the agent that killed it. A PUTLLC that
              * always fails for "no reservation" is useless without knowing who
              * took it away -- a peer SPU, or the PPU committing to the line. */

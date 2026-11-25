@@ -181,7 +181,7 @@ static void test_atomic_commands_use_an_aligned_lsa(void)
     atomic_cmd(&c, ea, 0x2000 + 0x4C, MFC_GETLLAR_CMD);
     CHECK(memcmp(c.ls + 0x2000, line, 128) == 0);
     CHECK(c.ls[0x1FFF] == 0xEE && c.ls[0x2080] == 0xEE);
-    CHECK(c.resv_valid);
+    CHECK((c.resv & 1u));
 
     /* PUTLLC from an unaligned LSA stores the aligned line and succeeds. */
     memcpy(c.ls + 0x2000, other, 128);

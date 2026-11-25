@@ -30,7 +30,7 @@ static void cleared(uint32_t ea,uint32_t n) {
 }
 static void reserve(uint32_t ea) {
     peer.mfc_eal=ea;peer.mfc_eah=0;peer.mfc_lsa=0x2000;
-    assert(spu_mfc_atomic(&peer,MFC_GETLLAR_CMD));assert(peer.resv_valid);
+    assert(spu_mfc_atomic(&peer,MFC_GETLLAR_CMD));assert((peer.resv & 1u));
     peer.event_status=0;
 }
 int main(void) {
@@ -63,16 +63,16 @@ int main(void) {
     prepare(ea,2048);memset(guest+ea,0,2048);reserve(ea+1920);
     first_peer.mfc_eal=ea;first_peer.mfc_eah=0;first_peer.mfc_lsa=0x2000;
     assert(spu_mfc_atomic(&first_peer,MFC_GETLLAR_CMD));
-    assert(first_peer.resv_valid);first_peer.event_status=0;
+    assert((first_peer.resv & 1u));first_peer.event_status=0;
     unsigned long notifications=g_spu_lr_raise;
     assert(mfc_submit(mfc_for(&writer),&writer,0x89)==0);
     assert(g_spu_lr_raise==notifications+2);
-    assert(!first_peer.resv_valid && (first_peer.event_status&SPU_EVENT_LR));
-    assert(!peer.resv_valid && (peer.event_status&SPU_EVENT_LR));
+    assert(!(first_peer.resv & 1u) && (first_peer.event_status&SPU_EVENT_LR));
+    assert(!(peer.resv & 1u) && (peer.event_status&SPU_EVENT_LR));
     be32(peer.ls+0x2000,0xABCDEF01);assert(spu_mfc_atomic(&peer,MFC_PUTLLC_CMD));
     assert(peer.atomic_stat==1 && guest[ea+1920]==0);
     reserve(ea+2048);assert(mfc_submit(mfc_for(&writer),&writer,0x89)==0);
-    assert(peer.resv_valid && !(peer.event_status&SPU_EVENT_LR));
+    assert((peer.resv & 1u) && !(peer.event_status&SPU_EVENT_LR));
     /* Unsupported storage-control forms fail without guest writes or a
      * successful tag receipt, including high EA bits instead of truncation. */
     const struct {uint64_t ea; uint32_t size;} invalid[]={
