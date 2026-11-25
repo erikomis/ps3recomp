@@ -135,6 +135,12 @@ const char* cellGame_get_title_id(void);
 const char* cellGame_get_hdd_title_id(void);
 const char* cellGame_get_title(void);
 
+/* Boot path of the running title (the disc-game's PS3_GAME dir, or the
+ * installed update's dir under /dev_hdd0/game when one booted). Returns NULL
+ * until the installed-update resolution of Redgrave961/ps3recomp@61abccc3 is
+ * ported; callers then fall back to the disc layout via cellfs_translate_path. */
+const char* cellGame_get_boot_path(void);
+
 /* Set the game's title string */
 void cellGame_set_title(const char* title);
 

@@ -70,7 +70,9 @@ static void init_default_mappings(void)
         return;
     s_initialized = 1;
 
-    cellfs_add_path_mapping("/dev_hdd0/",  "gamedata/dev_hdd0/");
+    const char* hdd0_root = getenv("PS3_HDD0_ROOT");
+    cellfs_add_path_mapping("/dev_hdd0/",
+                           hdd0_root && *hdd0_root ? hdd0_root : "gamedata/dev_hdd0/");
     const char* disc_root = getenv("PS3_VFS_ROOT");
     cellfs_add_path_mapping("/dev_bdvd/",
                            disc_root && *disc_root ? disc_root : "gamedata/dev_bdvd/");

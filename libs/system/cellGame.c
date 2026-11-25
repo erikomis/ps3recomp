@@ -859,3 +859,11 @@ s32 cellGameContentErrorDialog(s32 type, s32 errNeedSizeKB, const char* dirName)
 
     return CELL_OK;
 }
+
+const char* cellGame_get_boot_path(void)
+{
+    /* See the header: NULL until the installed-update boot resolution of
+     * Redgrave961/ps3recomp@61abccc3 is ported. Titles running from their
+     * disc dump (this toolkit's case) resolve through the /dev_bdvd fallback. */
+    return NULL;
+}

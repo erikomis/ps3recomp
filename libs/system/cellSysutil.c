@@ -412,6 +412,8 @@ static s32 sysutil_language(void)
     return lang;
 }
 
+s32 ps3_sysutil_language(void) { return sysutil_language(); }
+
 s32 cellSysutilGetSystemParamInt(s32 id, u32 value_ea)
 {
     if (!value_ea)
