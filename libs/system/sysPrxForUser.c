@@ -275,20 +275,10 @@ static int yz_format(char* out, size_t cap, const char* fmt, va_list ap)
     return (int)p;
 }
 
-/* The SPU printf service's setup call. A title that wants SPU-side debug
- * printf calls _sys_spu_printf_initialize(pun1, arg2, arg3, arg4) once at
- * boot and then attach/group calls; Asura's Wrath imports it (NID
- * 0x45FE2FCE) and creates the "_SPU_printf_server" thread around it. The
- * service is debug-only on hardware; accepting the setup and answering the
- * later attach calls with their return codes keeps that thread alive. */
-s32 _sys_spu_printf_initialize(u32 pun1, u64 arg2, u64 arg3, u64 arg4)
-{
-    printf("[sysPrxForUser] _sys_spu_printf_initialize(%u, 0x%llX, 0x%llX, 0x%llX)\n",
-           pun1, (unsigned long long)arg2, (unsigned long long)arg3,
-           (unsigned long long)arg4);
-    (void)pun1; (void)arg2; (void)arg3; (void)arg4;
-    return CELL_OK;
-}
+/* The SPU printf service's setup call was replaced by the full callback
+ * implementation from Redgrave961/ps3recomp@9924744a (see the next patch
+ * commit): initialize stores the four OPDs and attach/detach invoke the
+ * title's own callbacks. */
 
 s32 _sys_printf(const char* fmt, ...)
 {
