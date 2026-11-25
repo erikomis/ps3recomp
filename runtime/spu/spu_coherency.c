@@ -36,6 +36,11 @@ extern "C" {
 #include <intrin.h>
 #include <windows.h>   /* SwitchToThread */
 static volatile long g_lockline = 0;
+/* Sequence counter for the GETLLAR fast path (Vajra f87d3ca1): incremented on
+ * every acquire and release, so it is odd while the lock is held. A fast-path
+ * reader snapshots it, copies the line, and only trusts the copy if no
+ * lock transition happened in between (spu_lockline_unchanged). */
+static volatile long g_lockline_seq = 0;
 /* Test-and-test-and-set: spin on a plain read (no cache-line ping-pong) with a
  * pause, and yield after a long wait. The bare exchange loop let GH3's four
  * idle job-policy pollers saturate the line and delay every other SPU atomic
@@ -61,14 +66,31 @@ void spu_lockline_lock(void)
             }
         } while (g_lockline);
     }
+    _InterlockedIncrement(&g_lockline_seq);
 }
-void spu_lockline_unlock(void) { _InterlockedExchange(&g_lockline, 0); }
+void spu_lockline_unlock(void) { _InterlockedIncrement(&g_lockline_seq); _InterlockedExchange(&g_lockline, 0); }
+int spu_lockline_unchanged(uint32_t seq) { return (uint32_t)g_lockline_seq == seq; }
 #elif defined(_WIN32)
 /* Non-MSVC Windows keeps the plain spin, without a pthread dependency. */
 #include <stdatomic.h>
 static atomic_flag g_lockline = ATOMIC_FLAG_INIT;
-void spu_lockline_lock(void)   { while (atomic_flag_test_and_set_explicit(&g_lockline, memory_order_acquire)) { } }
-void spu_lockline_unlock(void) { atomic_flag_clear_explicit(&g_lockline, memory_order_release); }
+static _Atomic uint32_t g_lockline_seq = 0;
+void spu_lockline_lock(void)
+{
+    while (atomic_flag_test_and_set_explicit(&g_lockline, memory_order_acquire)) { }
+    atomic_store_explicit(&g_lockline_seq, atomic_load_explicit(&g_lockline_seq, memory_order_relaxed) + 1, memory_order_relaxed);
+    atomic_thread_fence(memory_order_release);
+}
+void spu_lockline_unlock(void)
+{
+    atomic_store_explicit(&g_lockline_seq, atomic_load_explicit(&g_lockline_seq, memory_order_relaxed) + 1, memory_order_release);
+    atomic_flag_clear_explicit(&g_lockline, memory_order_release);
+}
+int spu_lockline_unchanged(uint32_t seq)
+{
+    atomic_thread_fence(memory_order_acquire);
+    return atomic_load_explicit(&g_lockline_seq, memory_order_relaxed) == seq;
+}
 #else
 #include <pthread.h>
 #include <time.h>
@@ -85,6 +107,7 @@ void spu_lockline_unlock(void) { atomic_flag_clear_explicit(&g_lockline, memory_
  * preempted one no longer costs the waiters their cores. The mutex keeps the
  * same non-recursive exclusion and acquire/release publication. */
 static pthread_mutex_t g_lockline = PTHREAD_MUTEX_INITIALIZER;
+static uint32_t g_lockline_seq;
 static inline uint64_t spu_lockline_now_ns(void)
 {
 #if defined(__APPLE__)
@@ -103,7 +126,7 @@ static inline void spu_lockline_relax(void)
     __builtin_ia32_pause();
 #endif
 }
-void spu_lockline_lock(void)
+static void spu_lockline_acquire(void)
 {
     if (!pthread_mutex_trylock(&g_lockline)) return;
     const uint64_t give_up = spu_lockline_now_ns() + 20000u;
@@ -114,7 +137,23 @@ void spu_lockline_lock(void)
     }
     if (pthread_mutex_lock(&g_lockline)) abort();
 }
-void spu_lockline_unlock(void) { if (pthread_mutex_unlock(&g_lockline)) abort(); }
+void spu_lockline_lock(void)
+{
+    spu_lockline_acquire();
+    /* seq goes odd under the lock, even on release (Vajra f87d3ca1). */
+    __atomic_store_n(&g_lockline_seq, g_lockline_seq + 1, __ATOMIC_RELAXED);
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+}
+void spu_lockline_unlock(void)
+{
+    __atomic_store_n(&g_lockline_seq, g_lockline_seq + 1, __ATOMIC_RELEASE);
+    if (pthread_mutex_unlock(&g_lockline)) abort();
+}
+int spu_lockline_unchanged(uint32_t seq)
+{
+    __atomic_thread_fence(__ATOMIC_ACQUIRE);
+    return __atomic_load_n(&g_lockline_seq, __ATOMIC_RELAXED) == seq;
+}
 #endif
 
 /* ===========================================================================
@@ -321,13 +360,9 @@ __attribute__((weak)) void ppu_resv_break_line(uint32_t ea) { (void)ea; }
  * store and the load on both sides, the two fences are ordered, so at least
  * one side sees the other. Either the reader's copy already holds the write
  * (an ordinary GETLLAR after the store), or the writer sees the reservation
- * and ends it -- the reader may then hold a stale or torn copy, but its
- * PUTLLC fails and it has SPU_EVENT_LR, exactly as for a write landing just
- * after a locked GETLLAR. A writer that loads stale resv_valid/resv_ea is one
- * whose fence came first, so the copy already holds its data; at worst it
- * ends the new reservation spuriously. What the reader gives up is a copy
- * atomic against a writer's multi-store critical section, but such a copy is
- * always followed by that writer's notify, so the reservation is ended.
+ * and ends it. A writer that loads stale resv_valid/resv_ea is one whose fence
+ * came first, so the copy already holds its data; at worst it ends the new
+ * reservation spuriously.
  *
  * Two preconditions keep every writer of the line on that right-hand side:
  *  - the line is already marked. Marks are never cleared, so every store path
@@ -338,8 +373,7 @@ __attribute__((weak)) void ppu_resv_break_line(uint32_t ea) { (void)ea; }
  * Anything else takes the lock and spu_coh_reserve as before.
  *
  * Writers still hold the lock-line lock, so they stay serialized with each
- * other and with PUTLLC's compare-and-commit; only the reader stopped
- * waiting. resv_valid and resv_ea are accessed atomically on both sides of
+ * other and with PUTLLC's compare-and-commit. resv_valid and resv_ea are accessed atomically on both sides of
  * the race; everything else about a reservation is still only touched by the
  * owning thread or under the lock.
  * ===========================================================================*/
@@ -351,7 +385,7 @@ static inline int spu_coh_holds(const spu_context* c, uint32_t line)
            (__atomic_load_n(&c->resv_ea, __ATOMIC_RELAXED) & ~127u) == line;
 }
 
-int spu_coh_reserve_fast(spu_context* ctx, uint32_t ea)
+int spu_coh_reserve_fast(spu_context* ctx, uint32_t ea, uint32_t* seq)
 {
     if (!ctx || !__atomic_load_n(&ctx->coh_listed, __ATOMIC_RELAXED) ||
         !spu_coh_is_reserved(ea))
@@ -362,7 +396,8 @@ int spu_coh_reserve_fast(spu_context* ctx, uint32_t ea)
     __atomic_store_n(&ctx->resv_ea, ea, __ATOMIC_RELAXED);
     __atomic_store_n(&ctx->resv_valid, 1, __ATOMIC_RELAXED);
     __atomic_thread_fence(__ATOMIC_SEQ_CST);
-    return 1;
+    *seq = __atomic_load_n(&g_lockline_seq, __ATOMIC_ACQUIRE);
+    return !(*seq & 1u);
 }
 
 void spu_coh_notify_write_except(uint32_t ea, const void* self)

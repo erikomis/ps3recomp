@@ -318,8 +318,13 @@ static void test_registered_getllar_skips_the_lock(void)
     spu_atomic(&g_a, LSA_A, LINE_A, MFC_GETLLAR_CMD);   /* registers, marks */
     g_guest_mem[LINE_A + 5] = 0x77;
 
-    TEST("a registered holder's GETLLAR of a marked line does not wait for the lock");
-    CHECK(llar_completes_under_held_lock(LINE_A) == 1);
+    TEST("a registered holder's GETLLAR of a marked line skips the lock when no writer holds it");
+    uint32_t seq;
+    CHECK(spu_coh_reserve_fast(&g_a, LINE_A, &seq) == 1);
+    CHECK(spu_lockline_unchanged(seq));
+
+    TEST("...and waits out a writer's open critical section instead of copying through it");
+    CHECK(llar_completes_under_held_lock(LINE_A) == 0);
     CHECK(g_a.resv_valid == 1);
     CHECK_EQ_U32(g_a.resv_ea, LINE_A);
     CHECK_EQ_U32(g_a.ls[LSA_A + 5], 0x77);
